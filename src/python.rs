@@ -779,8 +779,11 @@ mod tests {
             eprintln!("no python on PATH, skipping");
             return;
         };
-        // resolved: macOS's temp folder is a symlink, and Python reports the files' real paths
-        let dir = std::env::temp_dir().canonicalize().unwrap().join(format!("fa-workers-test-{}", std::process::id()));
+        // macOS's temp folder is a symlink and Python reports the files' real paths; on Windows,
+        // canonicalize() would give a \\?\ path Python doesn't use
+        let tmp = std::env::temp_dir();
+        let tmp = if cfg!(windows) { tmp } else { tmp.canonicalize().unwrap() };
+        let dir = tmp.join(format!("fa-workers-test-{}", std::process::id()));
         let (hook, children) = (dir.join("hook"), dir.join("children"));
         fs::create_dir_all(&hook).unwrap();
         fs::create_dir_all(&children).unwrap();
