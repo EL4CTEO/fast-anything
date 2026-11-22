@@ -616,6 +616,32 @@ def derive_edges(original, cases, budget, limit):
                 took = attempt(base[:i] + [big] + base[i + 1:], kwargs)
                 if took is None:
                     break
+        kw_base = {k: small(v) for k, v in kwargs.items()}
+        for k, v in kwargs.items():
+            for e in edges(kw_base[k]):
+                if len(derived) >= limit or left() <= 0:
+                    return derived
+                next_kw = dict(kwargs)
+                next_kw[k] = e
+                attempt(base, next_kw)
+            if ("kw", k) in grown or bigger(kw_base[k], 4) is None:
+                continue
+            grown.add(("kw", k))
+            try:
+                t = time.perf_counter()
+                original(*copy.deepcopy(base), **copy.deepcopy(kwargs))
+                took = time.perf_counter() - t
+            except Exception:
+                continue
+            for factor in GROW:
+                big = bigger(kw_base[k], factor)
+                if big is None or len(derived) >= limit or took * 16 > left() / 2:
+                    break
+                next_kw = dict(kwargs)
+                next_kw[k] = big
+                took = attempt(base, next_kw)
+                if took is None:
+                    break
     return derived
 
 
@@ -645,6 +671,24 @@ def derive(original, cases, budget, limit):
                         continue
                     seen.add(key)
                     result = original(*copy.deepcopy(new_args), **copy.deepcopy(kwargs))
+                    encoded["result"] = enc(result)
+                except Exception:
+                    continue  # outside the function's domain: not a fair test
+                encoded["derived"] = True
+                derived.append(encoded)
+        for k, v in kwargs.items():
+            for smaller in variants(v, rng):
+                if len(derived) >= limit or time.perf_counter() - start > budget:
+                    return derived
+                new_kw = dict(kwargs)
+                new_kw[k] = smaller
+                try:
+                    encoded = {"args": enc(args), "kwargs": {key: enc(val) for key, val in new_kw.items()}}
+                    key = json.dumps(encoded, sort_keys=True)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    result = original(*copy.deepcopy(args), **copy.deepcopy(new_kw))
                     encoded["result"] = enc(result)
                 except Exception:
                     continue  # outside the function's domain: not a fair test

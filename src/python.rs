@@ -136,18 +136,26 @@ pub fn rust_type(annotation: &str, owned: bool) -> Option<String> {
         "bool" => "bool".into(),
         "str" if owned => "String".into(),
         "str" => "&str".into(),
-        "bytes" if !owned => "&[u8]".into(),
+        "bytes" if owned => "Vec<u8>".into(),
+        "bytes" => "&[u8]".into(),
+        "bytearray" if owned => "Vec<u8>".into(),
+        "bytearray" => "&[u8]".into(),
         "None" if owned => "()".into(),
         _ => {
             if let Some(x) = inner(&["list", "List", "Sequence"]) {
                 format!("Vec<{}>", rust_type(x, true)?)
             } else if let Some(x) = inner(&["tuple", "Tuple"]) {
-                let parts: Option<Vec<String>> = split_top(x).iter().map(|p| rust_type(p, true)).collect();
-                let parts = parts?;
-                if parts.iter().any(|p| p == "...") {
-                    return None;
+                let raw_parts = split_top(x);
+                if raw_parts.len() == 2 && raw_parts[1].trim() == "..." {
+                    format!("Vec<{}>", rust_type(&raw_parts[0], true)?)
+                } else {
+                    let parts: Option<Vec<String>> = raw_parts.iter().map(|p| rust_type(p, true)).collect();
+                    let parts = parts?;
+                    if parts.iter().any(|p| p == "...") {
+                        return None;
+                    }
+                    if parts.len() == 1 { format!("({},)", parts[0]) } else { format!("({})", parts.join(", ")) }
                 }
-                if parts.len() == 1 { format!("({},)", parts[0]) } else { format!("({})", parts.join(", ")) }
             } else if let Some(x) = inner(&["dict", "Dict", "Mapping"]) {
                 let kv = split_top(x);
                 if kv.len() != 2 {
@@ -300,7 +308,9 @@ fn py_value(v: &Value) -> String {
                     .collect();
                 format!("{{{}}}", inner.join(", "))
             }
-            Some((tag, Value::String(s))) if tag == "$bytes" => format!("bytes(base64={s})"),
+            Some((tag, Value::String(s))) if tag == "$bytes" => {
+                format!("__import__('base64').b64decode({s:?})")
+            }
             Some((tag, Value::String(s))) if tag == "$float" => format!("float({s:?})"),
             _ => v.to_string(),
         },
@@ -511,8 +521,13 @@ mod tests {
     fn maps_annotations() {
         assert_eq!(rust_type("str", false).as_deref(), Some("&str"));
         assert_eq!(rust_type("str", true).as_deref(), Some("String"));
+        assert_eq!(rust_type("bytes", false).as_deref(), Some("&[u8]"));
+        assert_eq!(rust_type("bytes", true).as_deref(), Some("Vec<u8>"));
+        assert_eq!(rust_type("bytearray", false).as_deref(), Some("&[u8]"));
+        assert_eq!(rust_type("bytearray", true).as_deref(), Some("Vec<u8>"));
         assert_eq!(rust_type("list[int]", false).as_deref(), Some("Vec<i64>"));
         assert_eq!(rust_type("List[str]", false).as_deref(), Some("Vec<String>"));
+        assert_eq!(rust_type("list[bytes]", false).as_deref(), Some("Vec<Vec<u8>>"));
         assert_eq!(rust_type("tuple[int, float]", true).as_deref(), Some("(i64, f64)"));
         assert_eq!(rust_type("tuple[int]", true).as_deref(), Some("(i64,)"));
         assert_eq!(
@@ -522,14 +537,18 @@ mod tests {
         assert_eq!(rust_type("float | None", false).as_deref(), Some("Option<f64>"));
         assert_eq!(rust_type("Optional[int]", false).as_deref(), Some("Option<i64>"));
         assert_eq!(rust_type("MyClass", false), None);
-        assert_eq!(rust_type("tuple[int, ...]", true), None);
+        assert_eq!(rust_type("tuple[int, ...]", true).as_deref(), Some("Vec<i64>"));
+        assert_eq!(rust_type("tuple[str, ...]", true).as_deref(), Some("Vec<String>"));
     }
 
     #[test]
     fn renders_python_values() {
         let v: Value =
-            serde_json::from_str(r#"[null, true, "a", {"$tuple": [1, 2]}, {"$dict": [["k", 1.5]]}]"#).unwrap();
-        assert_eq!(py_value(&v), r#"[None, True, "a", (1, 2), {"k": 1.5}]"#);
+            serde_json::from_str(r#"[null, true, "a", {"$bytes": "aGVsbG8="}, {"$tuple": [1, 2]}, {"$dict": [["k", 1.5]]}]"#).unwrap();
+        assert_eq!(
+            py_value(&v),
+            r#"[None, True, "a", __import__('base64').b64decode("aGVsbG8="), (1, 2), {"k": 1.5}]"#
+        );
     }
 
     #[test]
