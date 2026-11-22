@@ -4,7 +4,7 @@
 use crate::hotspot::Hotspot;
 use crate::state::{Ctx, Port, Verify};
 use crate::util::{output, tail};
-use crate::{cfamily, csharp, golang, java, node, php, python, ruby};
+use crate::{cfamily, csharp, golang, java, kotlin, node, php, python, ruby};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -25,6 +25,7 @@ pub enum Lang {
     Cpp,
     #[serde(rename = "csharp")]
     CSharp,
+    Kotlin,
 }
 
 #[derive(Deserialize)]
@@ -87,7 +88,10 @@ impl Lang {
 
     /// Ports called through the C entry point, with the port in src/port.rs.
     pub fn c_bridge(self) -> bool {
-        matches!(self, Lang::Ruby | Lang::Java | Lang::Go | Lang::Php | Lang::C | Lang::Cpp | Lang::CSharp)
+        matches!(
+            self,
+            Lang::Ruby | Lang::Java | Lang::Go | Lang::Php | Lang::C | Lang::Cpp | Lang::CSharp | Lang::Kotlin
+        )
     }
 
     pub fn label(self) -> &'static str {
@@ -101,6 +105,7 @@ impl Lang {
             Lang::C => "C",
             Lang::Cpp => "C++",
             Lang::CSharp => "C#",
+            Lang::Kotlin => "Kotlin",
         }
     }
 
@@ -114,6 +119,7 @@ impl Lang {
             Lang::Php => php::resolve(program, root),
             Lang::C | Lang::Cpp => cfamily::resolve(program, root),
             Lang::CSharp => csharp::resolve(program, root),
+            Lang::Kotlin => java::resolve(program, root),
         }
     }
 
@@ -127,6 +133,7 @@ impl Lang {
             Lang::Php => php::profile(ctx, exe, args),
             Lang::C | Lang::Cpp => cfamily::profile(ctx, exe, args, self),
             Lang::CSharp => csharp::profile(ctx, exe, args),
+            Lang::Kotlin => kotlin::profile(ctx, exe, args),
         }
     }
 
@@ -148,6 +155,7 @@ impl Lang {
             Lang::Php => php::record(ctx, exe, args, hs, out, limit),
             Lang::C | Lang::Cpp => cfamily::record(ctx, exe, args, hs, out, self),
             Lang::CSharp => csharp::record(ctx, exe, args, hs, out, limit),
+            Lang::Kotlin => kotlin::record(ctx, exe, args, hs, out, limit),
         }
     }
 
@@ -161,6 +169,7 @@ impl Lang {
             Lang::Php => php::scaffold(ctx, hs, helpers, port),
             Lang::C | Lang::Cpp => cfamily::scaffold(ctx, hs, helpers, port),
             Lang::CSharp => csharp::scaffold(ctx, hs, helpers, port),
+            Lang::Kotlin => kotlin::scaffold(ctx, hs, helpers, port),
         }
     }
 
@@ -174,6 +183,7 @@ impl Lang {
             Lang::Php => php::verify(ctx, port),
             Lang::C | Lang::Cpp => cfamily::verify(ctx, port),
             Lang::CSharp => csharp::verify(ctx, port),
+            Lang::Kotlin => kotlin::verify(ctx, port),
         }
     }
 
@@ -187,6 +197,7 @@ impl Lang {
             Lang::Php => php::enable(ctx, port),
             Lang::C | Lang::Cpp => cfamily::enable(ctx, port),
             Lang::CSharp => csharp::enable(ctx, port),
+            Lang::Kotlin => kotlin::enable(ctx, port),
         }
     }
 
@@ -200,6 +211,7 @@ impl Lang {
             Lang::Php => php::disable(ctx, port),
             Lang::C | Lang::Cpp => cfamily::disable(ctx, port),
             Lang::CSharp => csharp::disable(ctx, port),
+            Lang::Kotlin => kotlin::disable(ctx, port),
         }
     }
 
@@ -208,7 +220,7 @@ impl Lang {
         let exe = ctx.runtime()?;
         match self {
             Lang::Go => golang::bench_command(ctx, exe),
-            Lang::Java => java::bench_command(ctx, exe),
+            Lang::Java | Lang::Kotlin => java::bench_command(ctx, exe),
             Lang::C | Lang::Cpp => cfamily::bench_command(ctx, exe),
             Lang::CSharp => csharp::bench_command(ctx, exe),
             _ => Ok((exe.to_string(), ctx.state.command[1..].to_vec())),
@@ -229,7 +241,9 @@ impl Lang {
             Lang::Python => format!("{ext}.abi3.so"),
             Lang::Node => format!("{ext}.node"),
             // loaded through a C FFI (Fiddle, FFM, ...): the platform's own library name
-            Lang::Ruby | Lang::Java | Lang::Go | Lang::Php | Lang::C | Lang::Cpp | Lang::CSharp => built.clone(),
+            Lang::Ruby | Lang::Java | Lang::Go | Lang::Php | Lang::C | Lang::Cpp | Lang::CSharp | Lang::Kotlin => {
+                built.clone()
+            }
         };
         (built, dest)
     }

@@ -9,6 +9,7 @@ mod doctor;
 mod golang;
 mod hotspot;
 mod java;
+mod kotlin;
 mod mcp;
 mod native;
 mod node;
