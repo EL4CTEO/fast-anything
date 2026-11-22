@@ -55,7 +55,28 @@ def find_class(module, qualname):
     return target
 
 
+ARRAY_KINDS = "biuf"  # NumPy dtypes recorded: bool, int, unsigned, float
+MAX_ARRAY = 1 << 20  # bytes per recorded array, so recordings stay a sane size
+
+
+def enc_numpy(v):
+    """An ndarray or NumPy scalar as plain data (only called for values from the numpy module)."""
+    np = sys.modules["numpy"]
+    if isinstance(v, np.ndarray):
+        if v.dtype.kind not in ARRAY_KINDS:
+            raise Unsupported("ndarray of " + str(v.dtype))
+        if v.nbytes > MAX_ARRAY:
+            raise Unsupported("ndarray over 1 MiB")
+        a = np.ascontiguousarray(v)
+        return {"$ndarray": [a.dtype.str, list(a.shape), base64.b64encode(a.tobytes()).decode("ascii")]}
+    if isinstance(v, np.generic) and v.dtype.kind in ARRAY_KINDS:
+        return {"$npscalar": [v.dtype.str, v.item()]}
+    raise Unsupported(type(v).__name__)
+
+
 def enc(v):
+    if type(v).__module__ == "numpy" and "numpy" in sys.modules:
+        return enc_numpy(v)
     if v is None or isinstance(v, (bool, int, str)):
         return v
     fields = record_fields(v)
@@ -103,6 +124,13 @@ def dec(v):
                 for k, i in values.items():
                     object.__setattr__(obj, k, i)
                 return obj
+        if tag == "$ndarray":
+            import numpy as np
+            dtype, shape, data = x
+            return np.frombuffer(base64.b64decode(data), dtype=np.dtype(dtype)).reshape(shape).copy()
+        if tag == "$npscalar":
+            import numpy as np
+            return np.dtype(x[0]).type(x[1])
         raise ValueError("unknown tag " + tag)
     return v
 
@@ -110,6 +138,17 @@ def dec(v):
 def same(a, b):
     """Equality the way a caller would see it: list == tuple, floats within 1e-9, but 3 != 3.0
     (it prints differently)."""
+    np = sys.modules.get("numpy")
+    if np is not None:
+        if isinstance(a, np.ndarray) or isinstance(b, np.ndarray):
+            if not (isinstance(a, np.ndarray) and isinstance(b, np.ndarray)) or a.shape != b.shape or a.dtype != b.dtype:
+                return False
+            if a.dtype.kind == "f":
+                return bool(np.allclose(a, b, rtol=1e-9, atol=1e-12, equal_nan=True))
+            return bool(np.array_equal(a, b))
+        # a NumPy scalar compares like the Python number it holds (a.sum() vs a port's f64)
+        a = a.item() if isinstance(a, np.generic) else a
+        b = b.item() if isinstance(b, np.generic) else b
     if isinstance(a, bool) or isinstance(b, bool):
         return type(a) is type(b) and a == b
     fields = record_fields(a)
@@ -584,9 +623,15 @@ def cmd_verify(job, _argv):
 SLICE_LENGTHS = (0, 1, 2, 3, 5, 8, 13, 21, 34, 55)
 
 
+def is_array(value):
+    np = sys.modules.get("numpy")
+    return np is not None and isinstance(value, np.ndarray) and value.ndim >= 1
+
+
 def variants(value, rng):
-    """Smaller versions of a list/str/bytes/tuple argument: empty, tiny, and random slices."""
-    if not isinstance(value, (list, tuple, str, bytes)) or len(value) < 2 or record_fields(value) is not None:
+    """Smaller versions of a list/str/bytes/tuple argument (or an array, along its first axis): empty,
+    tiny, and random slices."""
+    if not (isinstance(value, (list, tuple, str, bytes)) or is_array(value)) or len(value) < 2 or record_fields(value) is not None:
         return []
     n = len(value)
     out = []
@@ -618,6 +663,15 @@ def edges(value):
                 value + NON_ASCII[3], ""]
     if isinstance(value, bytes):
         return [b"", value + b"\x00", b"\xff" + value]
+    if is_array(value):
+        if value.ndim != 1 or value.dtype.kind not in "iuf" or not len(value):
+            return []
+        out = [value[:0].copy()]
+        for x in {"f": (math.nan, math.inf, -math.inf, -0.0), "i": (0, -1), "u": (0,)}[value.dtype.kind]:
+            changed = value.copy()
+            changed[0] = x
+            out.append(changed)
+        return out
     if isinstance(value, (list, tuple)) and value:
         out = [type(value)()]
         for e in edges(value[0])[:4]:
@@ -630,7 +684,7 @@ def small(value):
     """A short version of a recorded value, so edge cases stay cheap when the real inputs are big."""
     if record_fields(value) is not None:
         return value
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, (list, tuple)) or is_array(value):
         return value[:8]
     if isinstance(value, (str, bytes)):
         return value[:64]
@@ -639,6 +693,10 @@ def small(value):
 
 def bigger(value, factor):
     """The value repeated factor times (None past BIG items or characters)."""
+    if is_array(value):
+        if not len(value) or len(value) * factor > BIG:
+            return None
+        return sys.modules["numpy"].concatenate([value] * factor)
     if not isinstance(value, (list, tuple, str, bytes)) or not value or len(value) * factor > BIG:
         return None
     if record_fields(value) is not None:
