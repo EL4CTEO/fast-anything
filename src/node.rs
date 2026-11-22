@@ -16,27 +16,91 @@ const RUNNER: &str = include_str!("node/runner.mjs");
 const RECORDER: &str = include_str!("node/recorder.cjs");
 
 pub fn is_node(program: &str) -> bool {
-    let stem = crate::util::program_stem(program);
-    stem == "node" || stem == "nodejs"
+    Runtime::of(program).is_some()
+}
+
+/// The JavaScript runtime the app runs on. Bun and Deno run the same ports: they load Node-API
+/// addons, and write the same .cpuprofile files as Node with --cpu-prof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Runtime {
+    Node,
+    Bun,
+    Deno,
+}
+
+impl Runtime {
+    pub fn of(program: &str) -> Option<Runtime> {
+        match crate::util::program_stem(program).as_str() {
+            "node" | "nodejs" => Some(Runtime::Node),
+            "bun" => Some(Runtime::Bun),
+            "deno" => Some(Runtime::Deno),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Runtime::Node => "node",
+            Runtime::Bun => "bun",
+            Runtime::Deno => "deno",
+        }
+    }
+
+    /// The app's own arguments: without the "run" of  bun run app.ts  or  deno run -A app.ts.
+    fn app_args(self, args: &[String]) -> &[String] {
+        match args.first() {
+            Some(a) if a == "run" && self != Runtime::Node => &args[1..],
+            _ => args,
+        }
+    }
+
+    /// Arguments that run the app with fast-anything's options first.
+    fn with(self, options: &[&str], args: &[String]) -> Vec<String> {
+        let mut out: Vec<String> = if self == Runtime::Deno { vec!["run".into()] } else { vec![] };
+        out.extend(options.iter().map(|o| o.to_string()));
+        out.extend(self.app_args(args).iter().cloned());
+        out
+    }
+
+    /// Arguments that run a script of fast-anything's (it needs files, env vars and the addon).
+    fn script(self, script: &Path) -> Vec<String> {
+        let mut out: Vec<String> = if self == Runtime::Deno { vec!["run".into(), "-A".into()] } else { vec![] };
+        out.push(script.to_string_lossy().into_owned());
+        out
+    }
+}
+
+/// The runtime behind a resolved executable (node unless it's bun or deno).
+fn runtime_of(exe: &str) -> Runtime {
+    Runtime::of(exe).unwrap_or(Runtime::Node)
 }
 
 pub fn resolve(program: &str, root: &Path) -> Result<String> {
     let prog = if program.contains(['/', '\\']) { root.join(program) } else { PathBuf::from(program) };
-    let out = output(
-        Command::new(&prog).args(["-p", "process.execPath + '\\n' + process.versions.node"]).current_dir(root),
-        "node",
-    )?;
+    let runtime = Runtime::of(program).unwrap_or(Runtime::Node);
+    let (args, minimum): (&[&str], u32) = match runtime {
+        Runtime::Node => (&["-p", "process.execPath + '\\n' + process.versions.node"], 22),
+        Runtime::Bun => (&["-p", "process.execPath + '\\n' + Bun.version"], 1),
+        Runtime::Deno => (&["eval", "-p", "Deno.execPath() + '\\n' + Deno.version.deno"], 2),
+    };
+    let out = output(Command::new(&prog).args(args).current_dir(root), runtime.name())?;
     ensure!(out.status.success(), "{program} failed:\n{}", tail(&combined(&out), 5));
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     let mut lines = text.lines();
     let exe = lines.next().unwrap_or_default().trim().to_string();
     let major: u32 = lines.next().unwrap_or_default().split('.').next().and_then(|m| m.parse().ok()).unwrap_or(0);
-    ensure!(major >= 22, "Node.js 22 or newer is needed (found {major})");
+    let label = match runtime {
+        Runtime::Node => "Node.js",
+        Runtime::Bun => "Bun",
+        Runtime::Deno => "Deno",
+    };
+    ensure!(major >= minimum, "{label} {minimum} or newer is needed (found {major})");
     Ok(exe)
 }
 
-/// The script in "node [flags] script.js args".
+/// The script in "node [flags] script.js args" (or "bun run ...", "deno run ...").
 fn entry(args: &[String]) -> Option<&String> {
+    let args = if args.first().is_some_and(|a| a == "run") { &args[1..] } else { args };
     let mut it = args.iter();
     while let Some(a) = it.next() {
         if matches!(
@@ -56,12 +120,18 @@ fn runner(ctx: &Ctx, node: &str, mode: &str, job: Value) -> Result<Output> {
     fs::write(&script, RUNNER)?;
     let job_path = ctx.fast.join(format!("job-{mode}.json"));
     fs::write(&job_path, serde_json::to_vec_pretty(&job)?)?;
+    let runtime = runtime_of(node);
     let out = output(
-        Command::new(node).arg(&script).arg(mode).arg(&job_path).current_dir(&ctx.root).stdin(Stdio::null()),
-        "node",
+        Command::new(node)
+            .args(runtime.script(&script))
+            .arg(mode)
+            .arg(&job_path)
+            .current_dir(&ctx.root)
+            .stdin(Stdio::null()),
+        runtime.name(),
     )?;
     if !out.status.success() {
-        bail!("the node {mode} step failed ({}):\n{}", out.status, tail(&combined(&out), 30));
+        bail!("the {} {mode} step failed ({}):\n{}", runtime.name(), out.status, tail(&combined(&out), 30));
     }
     Ok(out)
 }
@@ -71,14 +141,14 @@ pub fn profile(ctx: &Ctx, node: &str, args: &[String]) -> Result<Profile> {
     let dir = ctx.fast.join("cpuprof");
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir)?;
+    let runtime = runtime_of(node);
+    let dir_text = dir.to_string_lossy().into_owned();
     let out = output(
         Command::new(node)
-            .args(["--cpu-prof", "--cpu-prof-interval", "250", "--cpu-prof-dir"])
-            .arg(&dir)
-            .args(args)
+            .args(runtime.with(&["--cpu-prof", "--cpu-prof-interval", "250", "--cpu-prof-dir", &dir_text], args))
             .current_dir(&ctx.root)
             .stdin(Stdio::null()),
-        "node",
+        runtime.name(),
     )?;
     ensure!(out.status.success(), "the app failed ({}):\n{}", out.status, tail(&combined(&out), 30));
     let result = ctx.fast.join("profile.json");
@@ -118,18 +188,28 @@ pub fn record(ctx: &Ctx, node: &str, args: &[String], hs: &Hotspot, out: &Path, 
     let recorder = ctx.fast.join("recorder.cjs");
     fs::write(&recorder, RECORDER)?;
     let meta = out.with_extension("meta.json");
+    let runtime = runtime_of(node);
+    let recorder_text = recorder.to_string_lossy().into_owned();
+    let mut options: Vec<&str> = match runtime {
+        Runtime::Node => vec!["--require", &recorder_text],
+        Runtime::Bun | Runtime::Deno => vec!["--preload", &recorder_text],
+    };
+    if runtime == Runtime::Deno {
+        // the recorder reads its settings from env vars and writes its results to files; Deno
+        // rejects a permission given twice, or next to -A
+        let given = |flag: &str| args.iter().any(|a| a == "-A" || a == "--allow-all" || a.starts_with(flag));
+        options.extend(["--allow-env", "--allow-read", "--allow-write"].into_iter().filter(|f| !given(f)));
+    }
     let run = output(
         Command::new(node)
-            .arg("--require")
-            .arg(&recorder)
-            .args(args)
+            .args(runtime.with(&options, args))
             .current_dir(&ctx.root)
             .env("FAST_ANYTHING_RECORD_OUT", out)
             .env("FAST_ANYTHING_RECORD_META", &meta)
             .env("FAST_ANYTHING_RECORD_LIMIT", limit.to_string())
             .env(DISABLE_ENV, "1")
             .stdin(Stdio::null()),
-        "node",
+        runtime.name(),
     );
     fs::write(&file, &original)
         .with_context(|| format!("restoring {} (a copy is in {})", hs.file, backup.display()))?;
@@ -494,7 +574,10 @@ pub fn enable(ctx: &Ctx, port: &Port) -> Result<()> {
     if !rel.starts_with("../") {
         rel = format!("./{rel}");
     }
-    let block = shim(port, &rel, is_esm(&ctx.root, &file));
+    // Deno treats every file as an ES module except .cjs/.cts
+    let deno = ctx.state.runtime.as_deref().is_some_and(|exe| runtime_of(exe) == Runtime::Deno);
+    let cjs = matches!(file.extension().and_then(|e| e.to_str()), Some("cjs" | "cts"));
+    let block = shim(port, &rel, is_esm(&ctx.root, &file) || (deno && !cjs));
     fs::write(&file, with_shim(&text, port, &block)).with_context(|| format!("writing {}", port.file))
 }
 
@@ -556,6 +639,21 @@ fn without_shim(text: &str, port: &Port) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bun_and_deno_get_their_own_command_lines() {
+        let args = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+        assert_eq!(Runtime::of("/usr/local/bin/bun"), Some(Runtime::Bun));
+        assert_eq!(Runtime::of("C:\\deno\\deno.exe"), Some(Runtime::Deno));
+        assert!(is_node("bun") && is_node("deno") && !is_node("python"));
+        assert_eq!(Runtime::Node.with(&["--require", "r.cjs"], &args("app.js x")), args("--require r.cjs app.js x"));
+        assert_eq!(Runtime::Bun.with(&["--preload", "r.cjs"], &args("run app.ts")), args("--preload r.cjs app.ts"));
+        assert_eq!(Runtime::Deno.with(&["--cpu-prof"], &args("run -A app.ts x")), args("run --cpu-prof -A app.ts x"));
+        assert_eq!(Runtime::Deno.with(&["--cpu-prof"], &args("app.ts")), args("run --cpu-prof app.ts"));
+        assert_eq!(Runtime::Deno.script(Path::new("runner.mjs")), args("run -A runner.mjs"));
+        assert_eq!(entry(&args("run -A --allow-ffi app.ts data.txt")).map(String::as_str), Some("app.ts"));
+        assert_eq!(entry(&args("run app.ts")).map(String::as_str), Some("app.ts"));
+    }
 
     #[test]
     fn maps_typescript() {

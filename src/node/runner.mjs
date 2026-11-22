@@ -232,7 +232,7 @@ function projectRelative(root, file) {
 
 function profile(job) {
   const names = readdirSync(job.dir).filter((f) => f.endsWith(".cpuprofile"));
-  if (!names.length) throw new Error("node wrote no .cpuprofile");
+  if (!names.length) throw new Error("the runtime wrote no .cpuprofile (Bun and Deno need a version with --cpu-prof)");
   names.sort((a, b) => statSync(path.join(job.dir, b)).size - statSync(path.join(job.dir, a)).size);
   const prof = JSON.parse(readFileSync(path.join(job.dir, names[0]), "utf8"));
 
