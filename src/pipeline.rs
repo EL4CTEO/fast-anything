@@ -235,8 +235,23 @@ pub fn report(root: &Path) -> Result<ReportOut> {
     report::write(&Ctx::open(root)?)
 }
 
-/// What the agent gets told after a failed attempt.
+/// What the agent gets told after a failed attempt, or a right one that's slower than the original.
 pub fn feedback(v: &Verify) -> String {
+    if v.ok()
+        && let Some(m) = v.micro.filter(|_| v.slower())
+    {
+        return format!(
+            "\n\n## Your last attempt is right but slow\n\n\
+             All {} cases match, but a call takes {} in Rust against {} in the original ({} slower).\n\
+             Make it faster without changing any result: borrow inputs instead of converting them, \
+             no allocation or cloning per call, `with_capacity`, fast paths for common cases.\n{}",
+            v.total,
+            util::nanos(m.rust_ns),
+            util::nanos(m.original_ns),
+            util::times(1.0 / m.speedup),
+            if v.lang.c_bridge() { "\nFix src/port.rs.\n" } else { "\nFix src/lib.rs.\n" }
+        );
+    }
     let mut out = String::from("\n\n## Your last attempt failed\n\n");
     if let Some(log) = &v.build_log {
         out.push_str("It doesn't compile:\n\n```\n");
@@ -255,6 +270,9 @@ pub fn feedback(v: &Verify) -> String {
 pub fn agent_port(root: &Path, id: &str, agent_spec: &str, attempts: usize) -> Result<Verify> {
     let attempts = attempts.max(1);
     let mut last: Option<Verify> = None;
+    // A port that's right but slower goes back to the agent to speed up; if no later attempt is both
+    // right and faster, its sources are put back.
+    let mut right: Option<(Verify, Snapshot)> = None;
     for attempt in 1..=attempts {
         let ctx = Ctx::open(root)?;
         let port = ctx.state.ports.get(id).with_context(|| format!("{id} isn't ported"))?.clone();
@@ -267,12 +285,46 @@ pub fn agent_port(root: &Path, id: &str, agent_spec: &str, attempts: usize) -> R
         agent::run(agent_spec, &dir, &prompt, &dir.join("agent.log"))?;
         let (_, v) = verify(root, Some(id))?;
         show::verify(id, &v);
-        if v.ok() {
+        if v.ok() && !v.slower() {
             return Ok(v);
+        }
+        if v.ok() && right.as_ref().is_none_or(|(best, _)| speedup(&v) > speedup(best)) {
+            right = Some((v.clone(), snapshot(&dir.join("src"))?));
         }
         last = Some(v);
     }
+    if let Some((best, files)) = right
+        && last.as_ref().is_none_or(|v| !v.ok() || speedup(v) < speedup(&best))
+    {
+        ui::step(format!("putting back the right attempt of {id} ({} per call)", util::times(speedup(&best))));
+        for (path, bytes) in &files {
+            fs::write(path, bytes)?;
+        }
+        let (_, v) = verify(root, Some(id))?;
+        return Ok(v);
+    }
     Ok(last.unwrap_or_default())
+}
+
+fn speedup(v: &Verify) -> f64 {
+    v.micro.map(|m| m.speedup).unwrap_or(0.0)
+}
+
+/// Files and their bytes, to put back later.
+type Snapshot = Vec<(PathBuf, Vec<u8>)>;
+
+/// Every file under dir.
+fn snapshot(dir: &Path) -> Result<Snapshot> {
+    let mut out = Vec::new();
+    for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        let path = entry?.path();
+        if path.is_dir() {
+            out.extend(snapshot(&path)?);
+        } else {
+            out.push((path.clone(), fs::read(&path)?));
+        }
+    }
+    Ok(out)
 }
 
 pub fn go(
@@ -330,4 +382,28 @@ pub fn go(
     show::bench(&bench(root, runs)?);
     show::report(&report(root)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::Micro;
+
+    #[test]
+    fn slow_but_right_gets_asked_for_speed() {
+        let v = Verify {
+            built: true,
+            total: 10,
+            passed: 10,
+            micro: Some(Micro { original_ns: 1000.0, rust_ns: 4000.0, speedup: 0.25 }),
+            ..Verify::default()
+        };
+        let text = feedback(&v);
+        assert!(
+            text.contains("right but slow") && text.contains("All 10 cases match") && text.contains("4.0× slower"),
+            "{text}"
+        );
+        let wrong = Verify { failed: 1, ..v };
+        assert!(feedback(&wrong).contains("failed"));
+    }
 }
