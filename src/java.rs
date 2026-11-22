@@ -18,22 +18,22 @@ use std::process::{Command, Stdio};
 use std::time::Instant;
 
 const DESCRIBE: &str = include_str!("java/Describe.java");
-const JSON: &str = include_str!("java/Json.java");
-const REC: &str = include_str!("java/Rec.java");
-const BRIDGE: &str = include_str!("java/Bridge.java");
+pub(crate) const JSON: &str = include_str!("java/Json.java");
+pub(crate) const REC: &str = include_str!("java/Rec.java");
+pub(crate) const BRIDGE: &str = include_str!("java/Bridge.java");
 /// java options that take the next argument as their value.
 const VALUE_OPTS: &[&str] =
     &["-cp", "-classpath", "--class-path", "-p", "--module-path", "--add-modules", "--source", "--limit-modules"];
 
 /// How the app is started: a source file, or a Maven or Gradle build.
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum Runner {
+pub(crate) enum Runner {
     Source,
     Maven,
     Gradle,
 }
 
-fn runner(program: &str) -> Option<Runner> {
+pub(crate) fn runner(program: &str) -> Option<Runner> {
     match util::program_stem(program).trim_end_matches(".cmd").trim_end_matches(".bat") {
         "java" => Some(Runner::Source),
         "mvn" | "mvnw" | "mvnd" => Some(Runner::Maven),
@@ -65,7 +65,7 @@ fn build_tool(program: &str, root: &Path) -> Result<String> {
 }
 
 /// The JDK that runs the build: JAVA_HOME, else java on the PATH.
-fn build_java(root: &Path) -> Result<String> {
+pub(crate) fn build_java(root: &Path) -> Result<String> {
     match std::env::var_os("JAVA_HOME").filter(|h| !h.is_empty()) {
         Some(home) => {
             let java = Path::new(&home).join("bin").join(if cfg!(windows) { "java.exe" } else { "java" });
@@ -170,20 +170,24 @@ fn source_files(start: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// A method the profile can name: its JVM class (as the flight recording has it) and its source.
 #[derive(Deserialize, Clone)]
-struct Method {
-    class: String,
-    owner: String,
-    name: String,
-    path: PathBuf,
-    line: u32,
-    end_line: u32,
-    params: Vec<Param>,
-    returns: String,
-    blockers: Vec<String>,
-    warnings: Vec<String>,
-    calls: Vec<String>,
-    source: String,
+pub(crate) struct Method {
+    pub class: String,
+    pub owner: String,
+    pub name: String,
+    pub path: PathBuf,
+    pub line: u32,
+    pub end_line: u32,
+    pub params: Vec<Param>,
+    pub returns: String,
+    pub blockers: Vec<String>,
+    pub warnings: Vec<String>,
+    pub calls: Vec<String>,
+    pub source: String,
+    /// The id's module when it isn't the JVM class (Kotlin: demo, not demo.FuzzyKt).
+    #[serde(default)]
+    pub module: Option<String>,
 }
 
 fn describe(ctx: &Ctx, java: &str, files: &[PathBuf]) -> Result<Vec<Method>> {
@@ -211,7 +215,7 @@ fn hotspot(ctx: &Ctx, m: &Method, total: f64, wall: f64, own: u64, incl: u64) ->
         end_line: m.end_line,
         name: m.name.clone(),
         qualname: m.name.clone(),
-        module: Some(m.class.replace('$', ".")),
+        module: Some(m.module.clone().unwrap_or_else(|| m.class.replace('$', "."))),
         kind: "function".into(),
         tottime: own as f64 / total * wall,
         cumtime: incl as f64 / total * wall,
@@ -238,7 +242,7 @@ pub fn bench_command(ctx: &Ctx, program: &str) -> Result<(String, Vec<String>)> 
 }
 
 /// The app's command, ready to run: for Gradle without a lingering daemon.
-fn app_command(program: &str, args: &[String]) -> Command {
+pub(crate) fn app_command(program: &str, args: &[String]) -> Command {
     let mut cmd = Command::new(program);
     if runner(program) == Some(Runner::Gradle) {
         cmd.arg("--no-daemon");
@@ -248,6 +252,17 @@ fn app_command(program: &str, args: &[String]) -> Command {
 }
 
 pub fn profile(ctx: &Ctx, program: &str, args: &[String]) -> Result<Profile> {
+    profile_with(ctx, program, args, |java| describe(ctx, java, &sources(&ctx.root, program, args)?))
+}
+
+/// Profile the app with Flight Recorder and rank the methods `describe` finds in its sources
+/// (given the JDK that runs the build).
+pub(crate) fn profile_with(
+    ctx: &Ctx,
+    program: &str,
+    args: &[String],
+    describe: impl FnOnce(&str) -> Result<Vec<Method>>,
+) -> Result<Profile> {
     let build = runner(program) != Some(Runner::Source);
     let java = if build { build_java(&ctx.root)? } else { program.to_string() };
     let jfr_dir = ctx.fast.join("jfr");
@@ -270,21 +285,29 @@ pub fn profile(ctx: &Ctx, program: &str, args: &[String]) -> Result<Profile> {
     let wall = started.elapsed().as_secs_f64();
     ensure!(run.status.success(), "the app failed ({}):\n{}", run.status, tail(&combined(&run), 30));
     let mut events = Vec::new();
+    let mut unreadable = None;
     for f in fs::read_dir(&jfr_dir)?.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "jfr")) {
         let printed = output(
             Command::new(tool(&java, "jfr")).args(["print", "--events", "jdk.ExecutionSample", "--json"]).arg(&f),
             "jfr",
         )?;
-        ensure!(printed.status.success(), "reading the flight recording failed:\n{}", tail(&combined(&printed), 10));
+        if !printed.status.success() {
+            // a helper JVM the build stopped before it wrote its recording (Kotlin's compiler daemon)
+            unreadable.get_or_insert_with(|| tail(&combined(&printed), 10));
+            continue;
+        }
         let recording: Value = serde_json::from_slice(&printed.stdout).context("parsing the flight recording")?;
         if let Some(list) = recording["recording"]["events"].as_array() {
             events.extend(list.iter().cloned());
         }
     }
+    if let (true, Some(log)) = (events.is_empty(), unreadable) {
+        bail!("reading the flight recording failed:\n{log}");
+    }
     ensure!(!events.is_empty(), "no flight recording was written: did a JVM run the app?");
     let recording = serde_json::json!({ "recording": { "events": events } });
 
-    let methods = describe(ctx, &java, &sources(&ctx.root, program, args)?)?;
+    let methods = describe(&java)?;
     let mut by_name: HashMap<(String, String), Vec<usize>> = HashMap::new();
     for (i, m) in methods.iter().enumerate() {
         by_name.entry((m.class.clone(), m.name.clone())).or_default().push(i);
@@ -480,7 +503,7 @@ fn hotspot_of<'a>(ctx: &'a Ctx, port: &Port) -> Result<&'a Hotspot> {
 }
 
 /// The Java release a Maven or Gradle build compiles for, when it says.
-fn declared_release(root: &Path) -> Option<u32> {
+pub(crate) fn declared_release(root: &Path) -> Option<u32> {
     let num = |s: &str| -> Option<u32> {
         let digits: String =
             s.trim_start_matches(|c: char| !c.is_ascii_digit()).chars().take_while(char::is_ascii_digit).collect();
@@ -498,6 +521,7 @@ fn declared_release(root: &Path) -> Option<u32> {
             "VERSION_",
             "release =",
             "release.set(",
+            "jvmToolchain(",
         ] {
             for (i, _) in text.match_indices(key) {
                 if let Some(n) = num(&text[i + key.len()..(i + key.len() + 12).min(text.len())]) {
