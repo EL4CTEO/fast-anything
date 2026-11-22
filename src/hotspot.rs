@@ -48,6 +48,8 @@ pub struct Hotspot {
     /// Ruby: the module (or Object) whose method this is, as a Ruby expression.
     /// Python: the class of a @staticmethod.
     pub owner: Option<String>,
+    /// Python: dataclasses and NamedTuples from the same file that the signature uses, with their fields.
+    pub records: std::collections::BTreeMap<String, Vec<Param>>,
 }
 
 impl Hotspot {

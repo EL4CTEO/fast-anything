@@ -7,6 +7,7 @@ Modes: profile, record, verify. Not meant to be run by hand.
 
 import ast
 import base64
+import dataclasses
 import functools
 import importlib
 import importlib.util
@@ -34,9 +35,33 @@ class Unsupported(Exception):
     """A value that can't be recorded as plain data."""
 
 
+def record_fields(v):
+    """Field names of a dataclass or NamedTuple instance, None for anything else."""
+    if isinstance(v, tuple) and isinstance(getattr(type(v), "_fields", None), tuple):
+        return list(type(v)._fields)
+    if dataclasses.is_dataclass(v) and not isinstance(v, type):
+        return [f.name for f in dataclasses.fields(v)]
+    return None
+
+
+# modules recorded classes are looked up in, by the name they were recorded under
+MODULES = {}
+
+
+def find_class(module, qualname):
+    target = MODULES.get(module) or importlib.import_module(module)
+    for part in qualname.split("."):
+        target = getattr(target, part)
+    return target
+
+
 def enc(v):
     if v is None or isinstance(v, (bool, int, str)):
         return v
+    fields = record_fields(v)
+    if fields is not None:  # before tuple: a NamedTuple is one
+        cls = type(v)
+        return {"$obj": [cls.__module__, cls.__qualname__, [[f, enc(getattr(v, f))] for f in fields]]}
     if isinstance(v, float):
         return v if math.isfinite(v) else {"$float": repr(v)}
     if isinstance(v, list):
@@ -67,6 +92,17 @@ def dec(v):
             return {dec(i) for i in x}
         if tag == "$float":
             return float(x)
+        if tag == "$obj":
+            module, qualname, fields = x
+            cls = find_class(module, qualname)
+            values = {k: dec(i) for k, i in fields}
+            try:
+                return cls(**values)
+            except TypeError:  # fields left out of __init__
+                obj = cls.__new__(cls)
+                for k, i in values.items():
+                    object.__setattr__(obj, k, i)
+                return obj
         raise ValueError("unknown tag " + tag)
     return v
 
@@ -76,6 +112,9 @@ def same(a, b):
     (it prints differently)."""
     if isinstance(a, bool) or isinstance(b, bool):
         return type(a) is type(b) and a == b
+    fields = record_fields(a)
+    if fields is not None or record_fields(b) is not None:
+        return type(a) is type(b) and all(same(getattr(a, f), getattr(b, f)) for f in fields)
     if isinstance(a, float) or isinstance(b, float):
         if not (isinstance(a, float) and isinstance(b, float)):
             return False
@@ -180,8 +219,26 @@ def parse_file(path):
 
         walk(tree, "", "function")
         guard = next((n.lineno for n in tree.body if isinstance(n, ast.If) and is_main_guard(n.test)), None)
-        _files[path] = (src, by_line, top, guard)
+        records = {n.name: record_class_fields(n) for n in tree.body
+                   if isinstance(n, ast.ClassDef) and is_record_class(n)}
+        _files[path] = (src, by_line, top, guard, records)
     return _files[path]
+
+
+def is_record_class(node):
+    """@dataclass (or @dataclasses.dataclass(...)) or a NamedTuple subclass."""
+    for d in node.decorator_list:
+        name = dotted(d.func if isinstance(d, ast.Call) else d)
+        if name and name[-1] == "dataclass":
+            return True
+    return any((dotted(b) or [""])[-1] == "NamedTuple" for b in node.bases)
+
+
+def record_class_fields(node):
+    """(name, annotation) of each field, in order; ClassVars aren't fields."""
+    return [(n.target.id, ast.unparse(n.annotation)) for n in node.body
+            if isinstance(n, ast.AnnAssign) and isinstance(n.target, ast.Name)
+            and "ClassVar" not in ast.unparse(n.annotation)]
 
 
 def is_main_guard(test):
@@ -227,7 +284,7 @@ def describe(path, line, name, entry, base):
     parsed = parse_file(path)
     if parsed is None:
         return None
-    src, by_line, top, guard = parsed
+    src, by_line, top, guard, records = parsed
     hit = by_line.get(line)
     if hit is None or hit[0].name != name:
         return None
@@ -306,9 +363,15 @@ def describe(path, line, name, entry, base):
         warnings.append("missing type hints, types are inferred from recorded calls")
         factor *= 0.9
 
+    # dataclasses and NamedTuples from this file that the signature uses, with their fields
+    names = {n.id for p in [node.returns] + [a.annotation for a in positional + args.kwonlyargs] if p is not None
+             for n in ast.walk(p) if isinstance(n, ast.Name)}
+    used = {name: [{"name": f, "annotation": a} for f, a in fields] for name, fields in records.items() if name in names}
+
     lines = src.splitlines()
     first = min([node.lineno] + [d.lineno for d in node.decorator_list])
     return {
+        "records": used,
         "qualname": qualname,
         "module": module,
         "kind": kind,
@@ -462,6 +525,10 @@ def cmd_verify(job, _argv):
         sys.modules[spec.name] = entry
         spec.loader.exec_module(entry)
         module = entry
+        # as in the app, the entry script is __main__: for classes recorded there, and for ports
+        # that look up a class with py.import("__main__")
+        MODULES["__main__"] = entry
+        sys.modules["__main__"] = entry
     else:
         module = importlib.import_module(job["module"])
     original = getattr(getattr(module, job["owner"]) if job.get("owner") else module, job["func"])
@@ -519,7 +586,7 @@ SLICE_LENGTHS = (0, 1, 2, 3, 5, 8, 13, 21, 34, 55)
 
 def variants(value, rng):
     """Smaller versions of a list/str/bytes/tuple argument: empty, tiny, and random slices."""
-    if not isinstance(value, (list, tuple, str, bytes)) or len(value) < 2:
+    if not isinstance(value, (list, tuple, str, bytes)) or len(value) < 2 or record_fields(value) is not None:
         return []
     n = len(value)
     out = []
@@ -539,7 +606,7 @@ GROW = (4, 16, 64, 256, 512)  # how much bigger, step by step, than the short ve
 
 def edges(value):
     """Inputs where ports and originals tend to part ways, of the same type as the recorded value."""
-    if isinstance(value, bool):
+    if isinstance(value, bool) or record_fields(value) is not None:
         return []
     if isinstance(value, int):
         return [x for x in (0, 1, -1) if x != value]
@@ -561,6 +628,8 @@ def edges(value):
 
 def small(value):
     """A short version of a recorded value, so edge cases stay cheap when the real inputs are big."""
+    if record_fields(value) is not None:
+        return value
     if isinstance(value, (list, tuple)):
         return value[:8]
     if isinstance(value, (str, bytes)):
@@ -571,6 +640,8 @@ def small(value):
 def bigger(value, factor):
     """The value repeated factor times (None past BIG items or characters)."""
     if not isinstance(value, (list, tuple, str, bytes)) or not value or len(value) * factor > BIG:
+        return None
+    if record_fields(value) is not None:
         return None
     return value * factor
 
