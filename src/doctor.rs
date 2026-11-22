@@ -22,6 +22,7 @@ fn minimum(name: &str) -> &'static [u32] {
         "go" => &[1, 22],
         "php" => &[8, 1],
         "dotnet" => &[8],
+        "Rscript" => &[4, 0],
         _ => &[],
     }
 }
@@ -107,6 +108,12 @@ pub fn run() -> Result<()> {
             hint: "https://dot.net",
         },
         Check {
+            name: "Rscript",
+            found: version("Rscript", &["--version"]),
+            need: "for R apps (4.0+)",
+            hint: "https://www.r-project.org",
+        },
+        Check {
             name: "claude",
             found: version("claude", &["--version"]),
             need: "--agent claude",
@@ -138,7 +145,7 @@ pub fn run() -> Result<()> {
         }
     }
     ensure!(usable(&checks[0]), "Rust 1.85 or newer is needed to build ports");
-    ensure!(checks[1..9].iter().any(usable), "install Python, Node.js, Ruby, Java, Go, PHP, .NET or a C compiler");
+    ensure!(checks[1..10].iter().any(usable), "install Python, Node.js, Ruby, Java, Go, PHP, .NET, R or a C compiler");
     ui::ok("ready");
     Ok(())
 }

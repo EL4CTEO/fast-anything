@@ -15,6 +15,7 @@ mod node;
 mod php;
 mod pipeline;
 mod python;
+mod r;
 mod report;
 mod ruby;
 mod show;
