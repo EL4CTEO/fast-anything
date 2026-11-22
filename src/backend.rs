@@ -80,7 +80,7 @@ impl Lang {
             bail!("{hint}")
         } else {
             bail!(
-                "fast-anything speaks Python, Node.js (JavaScript/TypeScript), Ruby, Java, Go, PHP, C, C++ and C#. Start the command with one of them:\n    fast-anything scan -- python app.py\n    fast-anything scan -- node app.js\n    fast-anything scan -- ruby app.rb\n    fast-anything scan -- java App.java\n    fast-anything scan -- go run .\n    fast-anything scan -- php app.php\n    fast-anything scan -- clang -O2 main.c  (or gcc, g++, clang++, icpx)\n    fast-anything scan -- dotnet run -c Release"
+                "fast-anything speaks Python, Node.js (JavaScript/TypeScript), Ruby, Java, Go, PHP, C, C++ and C#. Start the command with one of them:\n    fast-anything scan -- python app.py\n    fast-anything scan -- node app.js  (or bun app.ts, deno run -A app.ts)\n    fast-anything scan -- ruby app.rb\n    fast-anything scan -- java App.java\n    fast-anything scan -- go run .\n    fast-anything scan -- php app.php\n    fast-anything scan -- clang -O2 main.c  (or gcc, g++, clang++, icpx)\n    fast-anything scan -- dotnet run -c Release"
             )
         }
     }

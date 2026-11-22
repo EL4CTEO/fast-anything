@@ -1,6 +1,6 @@
 [package]
 name = "fast-anything"
-version = "0.6.2"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Find the slow 5% of your app, have your coding agent rewrite just that in Rust, and prove it still behaves the same."
