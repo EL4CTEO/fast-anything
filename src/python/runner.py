@@ -55,7 +55,28 @@ def find_class(module, qualname):
     return target
 
 
+ARRAY_KINDS = "biuf"  # NumPy dtypes recorded: bool, int, unsigned, float
+MAX_ARRAY = 1 << 20  # bytes per recorded array, so recordings stay a sane size
+
+
+def enc_numpy(v):
+    """An ndarray or NumPy scalar as plain data (only called for values from the numpy module)."""
+    np = sys.modules["numpy"]
+    if isinstance(v, np.ndarray):
+        if v.dtype.kind not in ARRAY_KINDS:
+            raise Unsupported("ndarray of " + str(v.dtype))
+        if v.nbytes > MAX_ARRAY:
+            raise Unsupported("ndarray over 1 MiB")
+        a = np.ascontiguousarray(v)
+        return {"$ndarray": [a.dtype.str, list(a.shape), base64.b64encode(a.tobytes()).decode("ascii")]}
+    if isinstance(v, np.generic) and v.dtype.kind in ARRAY_KINDS:
+        return {"$npscalar": [v.dtype.str, v.item()]}
+    raise Unsupported(type(v).__name__)
+
+
 def enc(v):
+    if type(v).__module__ == "numpy" and "numpy" in sys.modules:
+        return enc_numpy(v)
     if v is None or isinstance(v, (bool, int, str)):
         return v
     fields = record_fields(v)
@@ -103,6 +124,13 @@ def dec(v):
                 for k, i in values.items():
                     object.__setattr__(obj, k, i)
                 return obj
+        if tag == "$ndarray":
+            import numpy as np
+            dtype, shape, data = x
+            return np.frombuffer(base64.b64decode(data), dtype=np.dtype(dtype)).reshape(shape).copy()
+        if tag == "$npscalar":
+            import numpy as np
+            return np.dtype(x[0]).type(x[1])
         raise ValueError("unknown tag " + tag)
     return v
 
@@ -110,6 +138,17 @@ def dec(v):
 def same(a, b):
     """Equality the way a caller would see it: list == tuple, floats within 1e-9, but 3 != 3.0
     (it prints differently)."""
+    np = sys.modules.get("numpy")
+    if np is not None:
+        if isinstance(a, np.ndarray) or isinstance(b, np.ndarray):
+            if not (isinstance(a, np.ndarray) and isinstance(b, np.ndarray)) or a.shape != b.shape or a.dtype != b.dtype:
+                return False
+            if a.dtype.kind == "f":
+                return bool(np.allclose(a, b, rtol=1e-9, atol=1e-12, equal_nan=True))
+            return bool(np.array_equal(a, b))
+        # a NumPy scalar compares like the Python number it holds (a.sum() vs a port's f64)
+        a = a.item() if isinstance(a, np.generic) else a
+        b = b.item() if isinstance(b, np.generic) else b
     if isinstance(a, bool) or isinstance(b, bool):
         return type(a) is type(b) and a == b
     fields = record_fields(a)
@@ -409,6 +448,7 @@ def cmd_profile(job, argv):
     entry, base = prepare_path(kind, target)
     root = job["root"]
     prof = cProfile.Profile()
+    sys.modules["_fast_anything_state"] = ChildState("profile", os.environ.get("FAST_ANYTHING_CHILDREN", ""))
     start = time.perf_counter()
     prof.enable()
     try:
@@ -416,9 +456,16 @@ def cmd_profile(job, argv):
     finally:
         prof.disable()
     wall = time.perf_counter() - start
+    del sys.modules["_fast_anything_state"]
 
+    stats = pstats.Stats(prof)
+    for worker in children(".prof"):  # what the app's multiprocessing workers ran
+        try:
+            stats.add(worker)
+        except (EOFError, ValueError, TypeError, OSError):
+            pass  # a worker that died before it finished writing
     rows = []
-    for (path, line, name), (_cc, ncalls, tottime, cumtime, _callers) in pstats.Stats(prof).stats.items():
+    for (path, line, name), (_cc, ncalls, tottime, cumtime, _callers) in stats.stats.items():
         if name.startswith("<") or not path or path.startswith("<"):
             continue
         rel = project_relative(root, path)
@@ -443,74 +490,170 @@ def cmd_profile(job, argv):
         json.dump({"wall": wall, "base": base_rel, "functions": functions}, f)
 
 
-def cmd_record(job, argv):
-    kind, target, rest = parse_target(argv)
-    prepare_path(kind, target)
-    os.environ[DISABLE_ENV] = "1"  # always record the original Python
-    limit = int(job["limit"])
-    rng = random.Random(0xFA57)
-    kept = []
-    stats = {"calls": 0, "skipped": 0, "unsupported": set()}
+class Recorder:
+    """Keeps a uniform sample of up to `limit` calls to the wrapped function (reservoir sampling)."""
 
-    def store(slot, case):
-        if len(kept) < limit:
-            kept.append(case)
+    def __init__(self, limit, seed):
+        self.limit, self.rng = limit, random.Random(seed)
+        self.reset()
+
+    def reset(self):
+        self.kept, self.calls, self.skipped, self.unsupported, self.mutates = [], 0, 0, set(), False
+
+    def store(self, slot, case):
+        if len(self.kept) < self.limit:
+            self.kept.append(case)
         else:
-            kept[slot % limit] = case
+            self.kept[slot % self.limit] = case
 
-    def wrap(original):
+    def wrap(self, original):
         @functools.wraps(original)
         def recorder(*args, **kwargs):
-            stats["calls"] += 1
-            slot = len(kept) if len(kept) < limit else rng.randrange(stats["calls"])
+            self.calls += 1
+            slot = len(self.kept) if len(self.kept) < self.limit else self.rng.randrange(self.calls)
             case = None
-            if slot < limit:
+            if slot < self.limit:
                 try:  # encode before the call, in case the function mutates its arguments
                     case = {"args": enc(list(args)), "kwargs": {k: enc(v) for k, v in kwargs.items()}}
                 except Unsupported as e:
-                    stats["skipped"] += 1
-                    stats["unsupported"].add(str(e))
+                    self.skipped += 1
+                    self.unsupported.add(str(e))
             try:
                 result = original(*args, **kwargs)
             except Exception as e:
                 if case is not None:
                     case["raises"] = type(e).__name__
-                    store(slot, case)
+                    self.store(slot, case)
                 raise
             if case is not None:
                 try:
                     if enc(list(args)) != case["args"] or {k: enc(v) for k, v in kwargs.items()} != case["kwargs"]:
-                        stats["mutates"] = True
+                        self.mutates = True
                 except Unsupported:
                     pass
                 try:
                     case["result"] = enc(result)
-                    store(slot, case)
+                    self.store(slot, case)
                 except Unsupported as e:
-                    stats["skipped"] += 1
-                    stats["unsupported"].add(str(e))
+                    self.skipped += 1
+                    self.unsupported.add(str(e))
             return result
 
         return recorder
 
-    if job["module"] == "__main__":
-        # the entry script wraps the function itself, via a block fast-anything inserted
-        import builtins
+    def install(self, job, main_module=None):
+        """Wrap the function where the app looks it up."""
+        if job["module"] == "__main__":
+            # the entry script wraps the function itself, via a block fast-anything inserted
+            import builtins
 
-        builtins.__fast_anything_wrap__ = wrap
-    else:
-        module = importlib.import_module(job["module"])
+            builtins.__fast_anything_wrap__ = self.wrap
+            if main_module is None:
+                return
+            module = main_module  # a spawned worker: the entry script is already imported
+        else:
+            module = importlib.import_module(job["module"])
         owner = getattr(module, job["owner"]) if job.get("owner") else module
-        wrapped = wrap(getattr(owner, job["func"]))
-        setattr(owner, job["func"], staticmethod(wrapped) if job.get("owner") else wrapped)
-    run_target(kind, target, rest)
+        original = getattr(owner, job["func"])
+        if not hasattr(original, "__wrapped__"):
+            wrapped = self.wrap(original)
+            setattr(owner, job["func"], staticmethod(wrapped) if job.get("owner") else wrapped)
 
-    with open(job["out"], "w", encoding="utf-8") as f:
-        for case in kept:
-            f.write(json.dumps(case, ensure_ascii=False) + "\n")
-    with open(job["meta"], "w", encoding="utf-8") as f:
-        json.dump({"calls": stats["calls"], "kept": len(kept), "skipped": stats["skipped"],
-                   "unsupported": sorted(stats["unsupported"]), "mutates": stats.get("mutates", False)}, f)
+    def write(self, out, meta):
+        with open(out, "w", encoding="utf-8") as f:
+            for case in self.kept:
+                f.write(json.dumps(case, ensure_ascii=False) + "\n")
+        with open(meta, "w", encoding="utf-8") as f:
+            json.dump({"calls": self.calls, "kept": len(self.kept), "skipped": self.skipped,
+                       "unsupported": sorted(self.unsupported), "mutates": self.mutates}, f)
+
+    def absorb(self, out, meta):
+        """Add what a worker recorded, keeping at most `limit` calls, sampled across all processes."""
+        with open(meta, encoding="utf-8") as f:
+            m = json.load(f)
+        with open(out, encoding="utf-8") as f:
+            cases = [json.loads(line) for line in f if line.strip()]
+        self.calls += m["calls"]
+        self.skipped += m["skipped"]
+        self.unsupported.update(m["unsupported"])
+        self.mutates = self.mutates or m["mutates"]
+        self.kept += cases
+        if len(self.kept) > self.limit:
+            self.kept = self.rng.sample(self.kept, self.limit)
+
+
+class ChildState:
+    """What a multiprocessing worker does while fast-anything profiles or records the app: its own
+    profiler or recorder, written to `out_dir` when the worker ends."""
+
+    def __init__(self, mode, out_dir, recorder=None):
+        self.mode, self.out_dir, self.recorder, self.profiler = mode, out_dir, recorder, None
+
+    def start(self):
+        if self.mode == "profile":
+            import cProfile
+
+            sys.setprofile(None)  # a forked worker inherits the parent's profiler
+            self.profiler = cProfile.Profile()
+            self.profiler.enable()
+        elif self.recorder is not None:
+            self.recorder.reset()  # a forked worker inherits the parent's calls so far
+
+    def finish(self):
+        if os.name == "posix":
+            import signal
+
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)  # don't stop halfway through writing
+        base = os.path.join(self.out_dir, str(os.getpid()))
+        # written under a temporary name, then renamed, so the parent never reads half a file
+        if self.profiler is not None:
+            self.profiler.disable()
+            self.profiler.dump_stats(base + ".tmp")
+            os.replace(base + ".tmp", base + ".prof")
+        elif self.recorder is not None:
+            self.recorder.write(base + ".tmp", base + ".meta.tmp")
+            os.replace(base + ".tmp", base + ".jsonl")
+            os.replace(base + ".meta.tmp", base + ".meta.json")
+
+
+def child_state():
+    """The ChildState for a worker started as a fresh interpreter (spawn, forkserver)."""
+    with open(os.environ["FAST_ANYTHING_JOB"], encoding="utf-8") as f:
+        job = json.load(f)
+    mode, out_dir = os.environ["FAST_ANYTHING_MODE"], os.environ["FAST_ANYTHING_CHILDREN"]
+    recorder = None
+    if mode == "record":
+        os.environ[DISABLE_ENV] = "1"
+        recorder = Recorder(int(job["limit"]), os.getpid())
+        recorder.install(job, sys.modules.get("__main__"))
+    state = ChildState(mode, out_dir, recorder)
+    sys.modules["_fast_anything_state"] = state
+    return state
+
+
+def children(suffix):
+    """Files the app's multiprocessing workers left (see ChildState)."""
+    out_dir = os.environ.get("FAST_ANYTHING_CHILDREN")
+    if not out_dir or not os.path.isdir(out_dir):
+        return []
+    return sorted(os.path.join(out_dir, n) for n in os.listdir(out_dir) if n.endswith(suffix))
+
+
+def cmd_record(job, argv):
+    kind, target, rest = parse_target(argv)
+    prepare_path(kind, target)
+    os.environ[DISABLE_ENV] = "1"  # always record the original Python
+    recorder = Recorder(int(job["limit"]), 0xFA57)
+    recorder.install(job)
+    sys.modules["_fast_anything_state"] = ChildState("record", os.environ.get("FAST_ANYTHING_CHILDREN", ""), recorder)
+    run_target(kind, target, rest)
+    del sys.modules["_fast_anything_state"]
+    for out in children(".jsonl"):
+        try:
+            recorder.absorb(out, out[: -len(".jsonl")] + ".meta.json")
+        except (OSError, ValueError, KeyError):
+            pass  # a worker that died before it finished writing
+    recorder.write(job["out"], job["meta"])
 
 
 def cmd_verify(job, _argv):
@@ -584,9 +727,15 @@ def cmd_verify(job, _argv):
 SLICE_LENGTHS = (0, 1, 2, 3, 5, 8, 13, 21, 34, 55)
 
 
+def is_array(value):
+    np = sys.modules.get("numpy")
+    return np is not None and isinstance(value, np.ndarray) and value.ndim >= 1
+
+
 def variants(value, rng):
-    """Smaller versions of a list/str/bytes/tuple argument: empty, tiny, and random slices."""
-    if not isinstance(value, (list, tuple, str, bytes)) or len(value) < 2 or record_fields(value) is not None:
+    """Smaller versions of a list/str/bytes/tuple argument (or an array, along its first axis): empty,
+    tiny, and random slices."""
+    if not (isinstance(value, (list, tuple, str, bytes)) or is_array(value)) or len(value) < 2 or record_fields(value) is not None:
         return []
     n = len(value)
     out = []
@@ -618,6 +767,15 @@ def edges(value):
                 value + NON_ASCII[3], ""]
     if isinstance(value, bytes):
         return [b"", value + b"\x00", b"\xff" + value]
+    if is_array(value):
+        if value.ndim != 1 or value.dtype.kind not in "iuf" or not len(value):
+            return []
+        out = [value[:0].copy()]
+        for x in {"f": (math.nan, math.inf, -math.inf, -0.0), "i": (0, -1), "u": (0,)}[value.dtype.kind]:
+            changed = value.copy()
+            changed[0] = x
+            out.append(changed)
+        return out
     if isinstance(value, (list, tuple)) and value:
         out = [type(value)()]
         for e in edges(value[0])[:4]:
@@ -630,7 +788,7 @@ def small(value):
     """A short version of a recorded value, so edge cases stay cheap when the real inputs are big."""
     if record_fields(value) is not None:
         return value
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, (list, tuple)) or is_array(value):
         return value[:8]
     if isinstance(value, (str, bytes)):
         return value[:64]
@@ -639,6 +797,10 @@ def small(value):
 
 def bigger(value, factor):
     """The value repeated factor times (None past BIG items or characters)."""
+    if is_array(value):
+        if not len(value) or len(value) * factor > BIG:
+            return None
+        return sys.modules["numpy"].concatenate([value] * factor)
     if not isinstance(value, (list, tuple, str, bytes)) or not value or len(value) * factor > BIG:
         return None
     if record_fields(value) is not None:
