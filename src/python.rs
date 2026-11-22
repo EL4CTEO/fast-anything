@@ -215,6 +215,12 @@ fn rust_default(value: &str) -> Option<String> {
     })
 }
 
+/// The PyO3 signature default for a parameter: its literal, or None when the Python default
+/// isn't a simple literal (the port then gets None and applies the default itself).
+fn signature_default(p: &crate::hotspot::Param) -> Option<String> {
+    p.default.as_deref().map(|d| rust_default(d).unwrap_or_else(|| "None".into()))
+}
+
 pub fn lib_rs(hs: &Hotspot, port: &Port) -> String {
     let params: Vec<String> = hs
         .params
@@ -222,7 +228,7 @@ pub fn lib_rs(hs: &Hotspot, port: &Port) -> String {
         .map(|p| {
             let ty =
                 p.annotation.as_deref().and_then(|a| rust_type(a, false)).unwrap_or_else(|| "&Bound<'_, PyAny>".into());
-            let ty = if p.default.as_deref() == Some("None") && !ty.starts_with("Option<") {
+            let ty = if signature_default(p).as_deref() == Some("None") && !ty.starts_with("Option<") {
                 format!("Option<{ty}>")
             } else {
                 ty
@@ -230,15 +236,17 @@ pub fn lib_rs(hs: &Hotspot, port: &Port) -> String {
             format!("{}: {ty}", ident(&p.name))
         })
         .collect();
-    let signature = if hs.params.iter().any(|p| p.default.is_some()) {
-        let parts: Vec<String> = hs
-            .params
-            .iter()
-            .map(|p| match p.default.as_deref().and_then(rust_default) {
+    let signature = if hs.params.iter().any(|p| p.default.is_some() || p.kwonly) {
+        let mut parts = vec![];
+        for (i, p) in hs.params.iter().enumerate() {
+            if p.kwonly && (i == 0 || !hs.params[i - 1].kwonly) {
+                parts.push("*".to_string());
+            }
+            parts.push(match signature_default(p) {
                 Some(d) => format!("{} = {d}", ident(&p.name)),
                 None => ident(&p.name),
-            })
-            .collect();
+            });
+        }
         format!("#[pyo3(signature = ({}))]\n", parts.join(", "))
     } else {
         String::new()
@@ -347,6 +355,14 @@ pub fn task_md(hs: &Hotspot, helpers: &[Hotspot], port: &Port, crate_dir: &Path)
     let mut notes = String::new();
     for w in &hs.warnings {
         notes.push_str(&format!("- Note: {w}.\n"));
+    }
+    for p in &hs.params {
+        if let Some(d) = p.default.as_deref().filter(|d| rust_default(d).is_none()) {
+            notes.push_str(&format!(
+                "- Note: `{}` defaults to `{d}` in Python; the Rust signature takes `None` for it, use that default then.\n",
+                p.name
+            ));
+        }
     }
     format!(
         "# Port `{id}` to Rust\n\n\
@@ -551,6 +567,34 @@ mod tests {
             py_value(&v),
             r#"[None, True, "a", __import__('base64').b64decode("aGVsbG8="), (1, 2), {"k": 1.5}]"#
         );
+    }
+
+    #[test]
+    fn signature_keeps_required_params_before_optional() {
+        use crate::hotspot::Param;
+        let param = |name: &str, annotation: &str, default: Option<&str>, kwonly: bool| Param {
+            name: name.into(),
+            annotation: Some(annotation.into()),
+            default: default.map(Into::into),
+            kwonly,
+        };
+        let mut hs = Hotspot {
+            name: "join_words".into(),
+            params: vec![
+                param("words", "list[str]", None, false),
+                param("n", "int", Some("3"), false),
+                param("sep", "str", Some("SEP"), false),
+            ],
+            ..Hotspot::default()
+        };
+        let lib = lib_rs(&hs, &port());
+        assert!(lib.contains("#[pyo3(signature = (words, n = 3, sep = None))]"), "{lib}");
+        assert!(lib.contains("fn join_words(words: Vec<String>, n: i64, sep: Option<&str>)"), "{lib}");
+
+        hs.params = vec![param("a", "int", Some("1"), false), param("b", "int", None, true)];
+        let lib = lib_rs(&hs, &port());
+        assert!(lib.contains("#[pyo3(signature = (a = 1, *, b))]"), "{lib}");
+        assert!(lib.contains("fn join_words(a: i64, b: i64)"), "{lib}");
     }
 
     #[test]

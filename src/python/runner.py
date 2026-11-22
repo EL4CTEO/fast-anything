@@ -295,7 +295,7 @@ def describe(path, line, name, entry, base):
                "default": ast.unparse(d) if d is not None else None}
               for a, d in zip(positional, defaults)]
     params += [{"name": a.arg, "annotation": ast.unparse(a.annotation) if a.annotation else None,
-                "default": ast.unparse(d) if d is not None else None}
+                "default": ast.unparse(d) if d is not None else None, "kwonly": True}
                for a, d in zip(args.kwonlyargs, args.kw_defaults)]
     returns = ast.unparse(node.returns) if node.returns else None
     if returns is None or any(p["annotation"] is None for p in params):

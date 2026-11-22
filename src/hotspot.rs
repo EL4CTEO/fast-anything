@@ -12,6 +12,8 @@ pub struct Param {
     pub annotation: Option<String>,
     /// Default value as source text, e.g. "2" or "None".
     pub default: Option<String>,
+    /// Keyword-only (after `*` in Python).
+    pub kwonly: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
