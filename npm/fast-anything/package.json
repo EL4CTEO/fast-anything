@@ -1,6 +1,6 @@
 {
   "name": "@el4cteo/fast-anything",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Don't rewrite it in Rust. Rewrite the 5% that's slow: profile Python, Node, Ruby, Java, Go, PHP, C, C++ or C# apps, port the hot functions with your coding agent, prove they behave the same.",
   "keywords": [
     "rust",
@@ -49,11 +49,11 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "@el4cteo/fast-anything-win32-x64": "0.6.1",
-    "@el4cteo/fast-anything-linux-x64": "0.6.1",
-    "@el4cteo/fast-anything-linux-arm64": "0.6.1",
-    "@el4cteo/fast-anything-darwin-arm64": "0.6.1",
-    "@el4cteo/fast-anything-darwin-x64": "0.6.1"
+    "@el4cteo/fast-anything-win32-x64": "0.6.2",
+    "@el4cteo/fast-anything-linux-x64": "0.6.2",
+    "@el4cteo/fast-anything-linux-arm64": "0.6.2",
+    "@el4cteo/fast-anything-darwin-arm64": "0.6.2",
+    "@el4cteo/fast-anything-darwin-x64": "0.6.2"
   },
   "publishConfig": {
     "access": "public"

@@ -2,11 +2,19 @@
 
 use std::fmt::Display;
 use std::io::IsTerminal;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 static QUIET: AtomicBool = AtomicBool::new(false);
 static COLOR: OnceLock<bool> = OnceLock::new();
+
+type Progress = Box<dyn FnMut(&str) + Send>;
+static PROGRESS: Mutex<Option<Progress>> = Mutex::new(None);
+
+/// While set, every step() line is passed here too, even when quiet (MCP progress notifications).
+pub fn set_progress(progress: Option<Progress>) {
+    *PROGRESS.lock().unwrap_or_else(|e| e.into_inner()) = progress;
+}
 
 pub fn set_quiet(quiet: bool) {
     QUIET.store(quiet, Ordering::Relaxed);
@@ -50,7 +58,11 @@ pub fn line(s: impl Display) {
 }
 
 pub fn step(s: impl Display) {
-    line(format!("{} {s}", rust("▸")));
+    let text = s.to_string();
+    if let Some(progress) = PROGRESS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        progress(&text);
+    }
+    line(format!("{} {text}", rust("▸")));
 }
 
 pub fn ok(s: impl Display) {

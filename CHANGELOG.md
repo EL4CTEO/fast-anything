@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.2
+
+- npm: the launcher sets the binary's execute bit, fixing `EACCES` on macOS and Linux (#27, thanks @podsni).
+- Python verify only accepts the exception type the original raises; a Rust panic no longer counts (#23).
+- `build` won't put an enabled port live if its Rust changed since verify (#25).
+- `doctor` checks minimum runtime versions and PHP's FFI extension (#31).
+- `go --agent` sends a right-but-slower port back to the agent for speed, and keeps the best right attempt (#35).
+- `verify --all` re-checks every port (#38).
+- MCP: progress notifications during long tool calls (#44).
+
+Thanks @mohitmishra786.
+
 ## 0.6.1
 
 - Python: verify tells ints from floats (#9); `@staticmethod`s can be ported (#13).

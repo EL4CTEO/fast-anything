@@ -24,6 +24,13 @@ pub fn scan(root: &Path, command: Vec<String>) -> Result<ScanOut> {
         "put the command that runs your app after --, e.g.  fast-anything scan -- python app.py"
     );
     let mut ctx = Ctx::open(root)?;
+    let command = match crate::python::unwrap_env_runner(&command, |argv| env_runner_output(&ctx.root, argv))? {
+        Some(unwrapped) => {
+            ui::step(format!("{} runs {}", ui::bold(command[..2].join(" ")), ui::bold(&unwrapped[0])));
+            unwrapped
+        }
+        None => command,
+    };
     let lang = crate::cfamily::refine(Lang::detect(&command[0])?, &command[1..]);
     let exe = lang.resolve(&command[0], &ctx.root)?;
     ui::step(format!("profiling {}", ui::bold(command.join(" "))));
@@ -37,6 +44,13 @@ pub fn scan(root: &Path, command: Vec<String>) -> Result<ScanOut> {
     ctx.state.hotspots = hotspots.clone();
     ctx.save()?;
     Ok(ScanOut { command, wall: profile.wall, hotspots })
+}
+
+/// What an env runner (uv, poetry, ...) prints for a command run in the project.
+fn env_runner_output(root: &Path, argv: &[&str]) -> Result<String> {
+    let out = util::output(std::process::Command::new(argv[0]).args(&argv[1..]).current_dir(root), argv[0])?;
+    ensure!(out.status.success(), "{} failed:\n{}", argv.join(" "), util::tail(&util::combined(&out), 10));
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 fn pick<'a>(hotspots: &'a [Hotspot], id: Option<&str>) -> Result<&'a Hotspot> {
@@ -101,6 +115,14 @@ pub fn port(root: &Path, id: Option<&str>, samples: usize) -> Result<PortOut> {
         );
     }
     let enabled = ctx.state.ports.get(&hs.id).is_some_and(|p| p.enabled);
+    let helpers: Vec<Hotspot> = hs
+        .calls
+        .iter()
+        .filter_map(|name| ctx.state.hotspots.iter().find(|h| h.file == hs.file && &h.name == name))
+        .cloned()
+        .collect();
+    let text = fs::read_to_string(ctx.root.join(&hs.file)).unwrap_or_default();
+    let sources: Vec<&str> = std::iter::once(&hs).chain(&helpers).map(|h| h.source.as_str()).collect();
     let port = Port {
         id: hs.id.clone(),
         file: hs.file.clone(),
@@ -115,13 +137,8 @@ pub fn port(root: &Path, id: Option<&str>, samples: usize) -> Result<PortOut> {
         lang,
         owner: hs.owner.clone(),
         line: hs.line,
+        sources: crate::state::verbatim(&text, &sources),
     };
-    let helpers: Vec<Hotspot> = hs
-        .calls
-        .iter()
-        .filter_map(|name| ctx.state.hotspots.iter().find(|h| h.file == hs.file && &h.name == name))
-        .cloned()
-        .collect();
     let task = lang.scaffold(&ctx, &hs, &helpers, &port)?;
     ctx.state.ports.insert(port.id.clone(), port);
     ctx.save()?;
@@ -142,6 +159,9 @@ pub fn verify(root: &Path, id: Option<&str>) -> Result<(String, Verify)> {
     let id = ctx.resolve_port(id)?;
     let port = ctx.state.ports[&id].clone();
     let source_hash = backend::source_hash(&ctx.crate_dir(&port))?;
+    if ctx.stale(&port) {
+        ui::warn(format!("{} changed since {id} was recorded: {}", port.file, stale_hint(&id)));
+    }
     ui::step(format!("building {} (release)", ui::bold(&port.ext)));
     let v = match backend::build(&ctx, &port)? {
         Err(log) => Verify { built: false, build_log: Some(log), ..Verify::default() },
@@ -188,6 +208,13 @@ pub fn verify_all(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// What to do about a port whose original changed after it was recorded.
+pub fn stale_hint(id: &str) -> String {
+    format!(
+        "its recorded calls and Rust may be out of date. Run  fast-anything port {id}  to record again, update the Rust, then verify (or --force)"
+    )
+}
+
 /// What to do about a port that's right but slower than the original.
 pub fn slower_hint() -> &'static str {
     "calling into Rust costs more than this function's work, so it won't be switched on. Port its caller instead (fewer, bigger calls), or  enable --force"
@@ -197,6 +224,9 @@ pub fn enable(root: &Path, id: Option<&str>, force: bool) -> Result<String> {
     let mut ctx = Ctx::open(root)?;
     let id = ctx.resolve_port(id)?;
     let port = ctx.state.ports[&id].clone();
+    if ctx.stale(&port) && !force {
+        bail!("{} changed since {id} was recorded: {}", port.file, stale_hint(&id));
+    }
     let verified = port.verify.as_ref().is_some_and(Verify::ok);
     if !verified && !force {
         bail!("{id} hasn't passed verify yet: run  fast-anything verify {id}  (or --force)");
@@ -222,6 +252,15 @@ pub fn disable(root: &Path, id: Option<&str>) -> Result<String> {
     }
     ctx.save()?;
     Ok(id)
+}
+
+/// Switch every enabled port back to the original code; returns their ids.
+pub fn disable_all(root: &Path) -> Result<Vec<String>> {
+    let ids: Vec<String> = Ctx::open(root)?.state.ports.values().filter(|p| p.enabled).map(|p| p.id.clone()).collect();
+    for id in &ids {
+        disable(root, Some(id))?;
+    }
+    Ok(ids)
 }
 
 pub fn build_all(root: &Path) -> Result<()> {
@@ -256,6 +295,9 @@ pub fn build_all(root: &Path) -> Result<()> {
 
 pub fn bench(root: &Path, runs: usize) -> Result<BenchResult> {
     let mut ctx = Ctx::open(root)?;
+    for p in ctx.state.ports.values().filter(|p| p.enabled && ctx.stale(p)) {
+        ui::warn(format!("{} changed since {} was recorded: {}", p.file, p.id, stale_hint(&p.id)));
+    }
     let result = bench::run(&ctx, runs.max(1))?;
     ctx.state.bench = Some(result.clone());
     ctx.save()?;

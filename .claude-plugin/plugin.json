@@ -1,6 +1,6 @@
 {
   "name": "fast-anything",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Find the slow 5% of your app, port just that to Rust, and prove it still behaves the same.",
   "author": {
     "name": "EL4CTEO"

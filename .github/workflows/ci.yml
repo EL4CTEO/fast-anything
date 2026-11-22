@@ -50,6 +50,7 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      - run: node --test npm/fast-anything/bin/fast-anything.test.js
       - run: cargo build --release
       - name: end to end on the demo (reference port instead of an agent)
         working-directory: examples/fuzzy-dedupe

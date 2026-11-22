@@ -51,6 +51,10 @@ pub struct Port {
     /// Where the function started when it was ported (to find it again among overloads).
     #[serde(default)]
     pub line: u32,
+    /// Source of the function and the helpers ported with it, as recorded (only text found verbatim
+    /// in the file). When one of them is gone, the original changed and the port may be stale.
+    #[serde(default)]
+    pub sources: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -70,6 +74,36 @@ pub struct Verify {
     pub lang: Lang,
     /// Hash of the crate's sources this result is for (see backend::source_hash).
     pub source_hash: Option<String>,
+}
+
+/// The forms a source may take in the file: as recorded, or with const and let swapped (a Node
+/// port switches its function's const to let while enabled).
+fn forms(source: &str) -> [String; 3] {
+    let source = source.replace("\r\n", "\n");
+    [source.replacen("const ", "let ", 1), source.replacen("let ", "const ", 1), source]
+}
+
+/// The source appears in the file as whole lines.
+fn found(text: &str, source: &str) -> bool {
+    let text = format!("\n{}\n", text.replace("\r\n", "\n"));
+    forms(source).iter().any(|s| text.contains(&format!("\n{}\n", s.trim_end_matches('\n'))))
+}
+
+/// The sources that start a line in the file, each extended to the end of its last line so that
+/// found() can match it as whole lines (see Port::sources).
+pub fn verbatim(text: &str, sources: &[&str]) -> Vec<String> {
+    let text = format!("\n{}\n", text.replace("\r\n", "\n"));
+    sources
+        .iter()
+        .filter(|s| !s.trim().is_empty())
+        .filter_map(|s| {
+            forms(s).iter().find_map(|form| {
+                let at = text.find(&format!("\n{form}"))? + 1;
+                let end = at + form.len() + text[at + form.len()..].find('\n')?;
+                Some(text[at..end].to_string())
+            })
+        })
+        .collect()
 }
 
 impl Verify {
@@ -109,6 +143,12 @@ pub struct Ctx {
 }
 
 impl Ctx {
+    /// The original changed since the port recorded it: its recorded calls and its Rust may be out of date.
+    pub fn stale(&self, port: &Port) -> bool {
+        let Ok(text) = fs::read_to_string(self.root.join(&port.file)) else { return false };
+        port.sources.iter().any(|s| !found(&text, s))
+    }
+
     pub fn open(root: &Path) -> Result<Ctx> {
         let root = util::absolute(root);
         ensure!(root.is_dir(), "{} isn't a folder", root.display());
@@ -187,5 +227,16 @@ mod tests {
         assert!(!v(1.4).slower());
         assert!(!v(0.0).slower(), "no measurement isn't slower");
         assert!(!Verify::default().slower());
+    }
+
+    #[test]
+    fn sources_are_found_verbatim() {
+        let file = "def f(x):\r\n    return x\r\n\r\nexport let g = (n) => n;\n";
+        let kept = verbatim(file, &["def f(x):\n    return x", "export const g = (n) => n", "def h(): pass", "  "]);
+        assert_eq!(kept, ["def f(x):\n    return x", "export let g = (n) => n;"], "extended to the end of the line");
+        assert!(found(&file.replace("export let", "export const"), &kept[1]), "const or let");
+        let edited = file.replace("return x", "return x + 1");
+        assert!(!found(&edited, &kept[0]), "an edited function is no longer found");
+        assert!(found(&format!("x = 1\n{}", kept[0]), &kept[0]), "at the end of a file without a final newline");
     }
 }
