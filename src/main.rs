@@ -95,7 +95,12 @@ enum Cmd {
         force: bool,
     },
     /// Switch back to the original code
-    Disable { id: Option<String> },
+    Disable {
+        id: Option<String>,
+        /// Switch every enabled port back
+        #[arg(long, conflicts_with = "id")]
+        all: bool,
+    },
     /// Rebuild every port (after cloning, or a toolchain upgrade)
     Build,
     /// Time your app with the originals vs the Rust ports
@@ -175,7 +180,17 @@ fn run(cmd: Cmd, root: &Path) -> Result<()> {
             show::next("fast-anything bench");
             Ok(())
         }
-        Cmd::Disable { id } => {
+        Cmd::Disable { all: true, .. } => {
+            let ids = pipeline::disable_all(root)?;
+            if ids.is_empty() {
+                ui::ok("no port was switched on");
+            }
+            for id in ids {
+                ui::ok(format!("{} is back to the original code", ui::bold(&id)));
+            }
+            Ok(())
+        }
+        Cmd::Disable { id, .. } => {
             let id = pipeline::disable(root, id.as_deref())?;
             ui::ok(format!("{} is back to the original code", ui::bold(&id)));
             Ok(())
@@ -202,6 +217,15 @@ fn run(cmd: Cmd, root: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disable_all_parses() {
+        assert!(matches!(
+            Cli::try_parse_from(["fast-anything", "disable", "--all"]).unwrap().cmd,
+            Cmd::Disable { all: true, id: None }
+        ));
+        assert!(Cli::try_parse_from(["fast-anything", "disable", "fuzzy.lev", "--all"]).is_err());
+    }
 
     #[test]
     fn verify_all_parses() {
