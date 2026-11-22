@@ -662,6 +662,7 @@ mod tests {
             lang: backend::Lang::Node,
             owner: Some("Text".into()),
             line: 2,
+            sources: vec![],
         };
         let block = shim(&port, "./x.node", true);
         assert!(block.contains("Text.pairs = process.getBuiltinModule"), "{block}");
