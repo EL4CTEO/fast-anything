@@ -110,7 +110,7 @@ pub fn record(ctx: &Ctx, node: &str, args: &[String], hs: &Hotspot, out: &Path, 
     let backup = backup_dir.join(slug(&hs.file));
     fs::write(&backup, &original)?;
 
-    let f = &hs.name;
+    let f = &target(&hs.name, hs.owner.as_deref());
     let wrap = format!("{f} = globalThis.__fastAnythingWrap ? globalThis.__fastAnythingWrap({f}) : {f};");
     let entry = hs.module.as_deref() == Some("__main__");
     let reassignable = redeclare(&original, "const", "let", f).unwrap_or_else(|| original.clone());
@@ -432,7 +432,10 @@ pub fn verify(ctx: &Ctx, port: &Port) -> Result<Verify> {
     // inside the module, then the file goes back byte for byte.
     let file = ctx.root.join(&port.file);
     let text = fs::read_to_string(&file).with_context(|| format!("reading {}", port.file))?;
-    let hand_over = format!("if (globalThis.__fastAnythingOriginal) globalThis.__fastAnythingOriginal({});", port.func);
+    let hand_over = format!(
+        "if (globalThis.__fastAnythingOriginal) globalThis.__fastAnythingOriginal({});",
+        target(&port.func, port.owner.as_deref())
+    );
     let mut patches = crate::native::Patches::new(ctx)?;
     patches.write(&file, &backend::append_marked(&text, "//", &format!("verifying {}", port.id), &hand_over))?;
     let run = runner(ctx, node, "verify", job);
@@ -468,6 +471,11 @@ fn is_esm(root: &Path, file: &Path) -> bool {
     false
 }
 
+/// How the module refers to the function: its name, or Class.name for a static method.
+fn target(name: &str, owner: Option<&str>) -> String {
+    owner.map_or_else(|| name.to_string(), |class| format!("{class}.{name}"))
+}
+
 pub fn shim(port: &Port, addon_rel: &str, esm: bool) -> String {
     let load = if esm {
         format!("process.getBuiltinModule(\"node:module\").createRequire(import.meta.url)(\"{addon_rel}\")")
@@ -479,7 +487,7 @@ pub fn shim(port: &Port, addon_rel: &str, esm: bool) -> String {
         format!("// Undo with:  fast-anything disable {}", port.id),
         "if (!process.env.FAST_ANYTHING_DISABLE) {".to_string(),
         "  try {".to_string(),
-        format!("    {f} = {load}.{f};", f = port.func),
+        format!("    {} = {load}.{};", target(&port.func, port.owner.as_deref()), port.func),
         "  } catch {}".to_string(),
         "}".to_string(),
     ]
@@ -539,7 +547,7 @@ fn let_note(name: &str) -> String {
 
 fn with_shim(text: &str, port: &Port, block: &str) -> String {
     let note = let_note(&port.func);
-    let (text, swapped) = match redeclare(text, "const", "let", &port.func) {
+    let (text, swapped) = match redeclare(text, "const", "let", &port.func).filter(|_| port.owner.is_none()) {
         Some(t) => (t, true),
         None => (text.to_string(), text.contains(&note)), // already swapped by an earlier enable
     };
@@ -635,6 +643,33 @@ mod tests {
         let original = "let pairs = (n) => n;\n";
         let on = with_shim(original, &port, "pairs = rust.pairs;");
         assert!(!on.contains("puts the const back"));
+        assert_eq!(without_shim(&on, &port), original);
+    }
+
+    #[test]
+    fn static_methods_go_through_their_class() {
+        let port = Port {
+            id: "lib.Text.pairs".into(),
+            file: "lib.mjs".into(),
+            module: "lib".into(),
+            func: "pairs".into(),
+            ext: "fa_lib_text_pairs".into(),
+            crate_dir: ".fast/ports/lib.Text.pairs".into(),
+            recorded: 1,
+            calls_seen: 1,
+            verify: None,
+            enabled: false,
+            lang: backend::Lang::Node,
+            owner: Some("Text".into()),
+            line: 2,
+        };
+        let block = shim(&port, "./x.node", true);
+        assert!(block.contains("Text.pairs = process.getBuiltinModule"), "{block}");
+        assert!(block.contains("(\"./x.node\").pairs;"), "{block}");
+        // a same-named const elsewhere is left alone
+        let original = "const pairs = 1;\nexport class Text {\n  static pairs(n) {\n    return n;\n  }\n}\n";
+        let on = with_shim(original, &port, &block);
+        assert!(on.starts_with("const pairs = 1;"), "{on}");
         assert_eq!(without_shim(&on, &port), original);
     }
 

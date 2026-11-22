@@ -161,7 +161,19 @@ function describe(file, line0, name, entry, root) {
       blockers.push("lives in the entry script, which runs on import: put its main code under if (import.meta.main) (or require.main === module)");
     else if (lineStart > guard) blockers.push("defined inside or after the if (import.meta.main) block");
   }
-  if (kind === "method" || indent > 0) blockers.push("method or nested function (top-level functions only for now)");
+  // a static method directly in the body of a top-level class is called as Class.name(...), like a function
+  let owner = null;
+  if (kind === "method" && m[2]) {
+    for (const c of code.matchAll(new RegExp("^(?:export\\s+)?(?:default\\s+)?class\\s+(" + IDENT + ")[^{]*\\{", "gm"))) {
+      const body = c.index + c[0].length - 1;
+      if (body > lineStart || matching(code, body) < close) continue;
+      let depth = 0;
+      for (const ch of code.slice(body, lineStart)) depth += ch === "{" ? 1 : ch === "}" ? -1 : 0;
+      if (depth === 1) owner = c[1];
+    }
+  }
+  if ((kind === "method" && !owner) || (kind !== "method" && indent > 0))
+    blockers.push("method or nested function (top-level functions and static methods only for now)");
   if (kind === "function" && m[4]) blockers.push("async");
   if (kind === "function" && m[5]) blockers.push("generator (function*)");
   if (kind === "binding" && m[5]) blockers.push("async");
@@ -207,8 +219,9 @@ function describe(file, line0, name, entry, root) {
     factor *= 0.9;
   }
   return {
-    qualname: name,
+    qualname: owner ? owner + "." + name : name,
     module,
+    owner,
     kind: kind === "method" || indent > 0 ? "method" : "function",
     end_line: src.slice(0, bodyEnd + 1).split("\n").length,
     params: params.map(({ name, annotation }) => ({ name, annotation })),
