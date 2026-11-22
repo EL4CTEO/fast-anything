@@ -670,6 +670,32 @@ mod tests {
     }
 
     #[test]
+    fn verify_wants_the_same_exception_not_a_panic() {
+        let Some(python) = ["python3", "python"]
+            .into_iter()
+            .find(|p| Command::new(p).arg("--version").output().is_ok_and(|o| o.status.success()))
+        else {
+            eprintln!("no python on PATH, skipping");
+            return;
+        };
+        let runner = std::env::temp_dir().join(format!("fa-runner-raises-{}.py", std::process::id()));
+        fs::write(&runner, RUNNER).unwrap();
+        let check = "import runpy, sys\n\
+                     ns = runpy.run_path(sys.argv[1])\n\
+                     raises_like, best_pass = ns['raises_like'], ns['best_pass']\n\
+                     class PanicException(BaseException): pass\n\
+                     assert raises_like(ValueError('x'), 'ValueError')\n\
+                     assert not raises_like(KeyError('x'), 'ValueError')\n\
+                     assert not raises_like(PanicException('index out of bounds'), 'ValueError')\n\
+                     assert not raises_like(None, 'ValueError')\n\
+                     def panics(*a):\n    raise PanicException('boom')\n\
+                     assert best_pass(panics, [((), {})], 0.0) >= 0\n";
+        let out = Command::new(python).args(["-I", "-c", check]).arg(&runner).output().unwrap();
+        let _ = fs::remove_file(&runner);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[test]
     fn spots_python() {
         assert!(is_python("python"));
         assert!(is_python("python3.12"));

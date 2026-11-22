@@ -486,7 +486,7 @@ def cmd_verify(job, _argv):
         except BaseException as e:  # Rust panics arrive as PanicException (a BaseException)
             got, err = None, e
         if "raises" in case:
-            ok, expected = err is not None, "raises " + case["raises"]
+            ok, expected = raises_like(err, case["raises"]), "raises " + case["raises"]
         else:
             want = dec(case["result"])
             ok, expected = err is None and same(want, got), show(want)
@@ -710,6 +710,12 @@ def derive(original, cases, budget, limit):
     return derived
 
 
+def raises_like(err, name):
+    """The port raised the exception the original did. A Rust panic (PanicException, a BaseException)
+    never counts: the app's except clauses won't catch it."""
+    return isinstance(err, Exception) and type(err).__name__ == name
+
+
 def best_pass(fn, calls, budget):
     """Fastest time to replay every recorded call once, within a time budget."""
     best, spent, passes = float("inf"), 0.0, 0
@@ -718,7 +724,9 @@ def best_pass(fn, calls, budget):
         for args, kwargs in calls:
             try:
                 fn(*args, **kwargs)
-            except Exception:
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException:  # Rust panics arrive as PanicException
                 pass
         took = time.perf_counter() - start
         best, spent, passes = min(best, took), spent + took, passes + 1
