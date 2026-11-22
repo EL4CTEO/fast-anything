@@ -72,8 +72,8 @@ def dec(v):
 
 
 def same(a, b):
-    """Equality the way a caller would see it: list == tuple, floats within 1e-9, but 3 != 3.0
-    (it prints differently)."""
+    """Equality the way a caller would see it: floats within 1e-9, but 3 != 3.0 (it prints
+    differently) and a list isn't a tuple (it can't be hashed)."""
     if isinstance(a, bool) or isinstance(b, bool):
         return type(a) is type(b) and a == b
     if isinstance(a, float) or isinstance(b, float):
@@ -83,6 +83,8 @@ def same(a, b):
             return math.isnan(a) and math.isnan(b)
         return math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-12)
     if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+        if isinstance(a, tuple) != isinstance(b, tuple):
+            return False
         return len(a) == len(b) and all(same(x, y) for x, y in zip(a, b))
     if isinstance(a, dict) and isinstance(b, dict):
         return a.keys() == b.keys() and all(same(a[k], b[k]) for k in a)
