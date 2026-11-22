@@ -23,6 +23,8 @@ fn minimum(name: &str) -> &'static [u32] {
         "php" => &[8, 1],
         "dotnet" => &[8],
         "Rscript" => &[4, 0],
+        "bun" => &[1],
+        "deno" => &[2],
         _ => &[],
     }
 }
@@ -114,6 +116,18 @@ pub fn run() -> Result<()> {
             hint: "https://www.r-project.org",
         },
         Check {
+            name: "bun",
+            found: version("bun", &["--version"]),
+            need: "to run JS/TS apps on Bun (instead of node)",
+            hint: "https://bun.sh",
+        },
+        Check {
+            name: "deno",
+            found: version("deno", &["--version"]),
+            need: "to run JS/TS apps on Deno (instead of node)",
+            hint: "https://deno.com",
+        },
+        Check {
             name: "claude",
             found: version("claude", &["--version"]),
             need: "--agent claude",
@@ -145,7 +159,10 @@ pub fn run() -> Result<()> {
         }
     }
     ensure!(usable(&checks[0]), "Rust 1.85 or newer is needed to build ports");
-    ensure!(checks[1..10].iter().any(usable), "install Python, Node.js, Ruby, Java, Go, PHP, .NET, R or a C compiler");
+    ensure!(
+        checks[1..12].iter().any(usable),
+        "install Python, Node.js (or Bun, Deno), Ruby, Java, Go, PHP, .NET, R or a C compiler"
+    );
     ui::ok("ready");
     Ok(())
 }

@@ -5,6 +5,10 @@
 <p align="center"><b>Don't rewrite it in Rust. Rewrite the 5% that's slow.</b></p>
 
 <p align="center">
+  <a href="https://trendshift.io/repositories/371252"><img src="https://trendshift.io/api/badge/repositories/371252" alt="EL4CTEO/fast-anything | Trendshift" width="250" height="55"></a>
+</p>
+
+<p align="center">
   <a href="https://www.npmjs.com/package/@el4cteo/fast-anything"><img src="https://img.shields.io/npm/v/@el4cteo/fast-anything?color=f74c00&label=npm" alt="npm"></a>
   <a href="https://crates.io/crates/fast-anything"><img src="https://img.shields.io/crates/v/fast-anything?color=f74c00" alt="crates.io"></a>
   <a href="https://github.com/EL4CTEO/fast-anything/actions/workflows/ci.yml"><img src="https://github.com/EL4CTEO/fast-anything/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
@@ -31,7 +35,7 @@ Ports are compiled with your Rust toolchain ([rustup](https://rustup.rs)).
 ## Use
 
 ```sh
-fast-anything go --agent claude -- python app.py     # or: -- node app.ts / ruby app.rb / java App.java / mvn exec:java / gradle run / go run . / php app.php / clang -O2 main.c / Rscript app.R
+fast-anything go --agent claude -- python app.py     # or: -- node app.ts / bun app.ts / deno run -A app.ts / ruby app.rb / java App.java / mvn exec:java / gradle run / go run . / php app.php / clang -O2 main.c / Rscript app.R
 ```
 
 Or step by step:
@@ -89,7 +93,7 @@ fast-anything ports the outermost loop it can, not the tiny function called insi
 | language | binding | status |
 |---|---|---|
 | Python 3.10+ | PyO3 | ✅ |
-| JavaScript / TypeScript (Node 22+) | napi-rs | ✅ |
+| JavaScript / TypeScript (Node 22+, Bun, Deno 2+: `bun app.ts`, `deno run -A app.ts`) | napi-rs | ✅ |
 | Ruby 3.3+ | C ABI + JSON, through Ruby's built-in Fiddle | ✅ |
 | Java 22+ (`java App.java`, Maven, Gradle) | the same C bridge, through the FFM API | ✅ |
 | Go 1.22+ (`go run .`) | the same C bridge, through the Windows loader or dlopen (cgo) | ✅ |
@@ -98,7 +102,7 @@ fast-anything ports the outermost loop it can, not the tiny function called insi
 | C# / .NET 8+ (`dotnet run -c Release`) | the same C bridge, through NativeLibrary; profiled with EventPipe, nothing to install | ✅ |
 | R 4.0+ (`Rscript app.R`) | the same C bridge, through base R's `.C()`; profiled with Rprof, no packages or R headers needed | ✅ |
 
-It ports top-level, deterministic functions that take plain data (numbers, strings, lists, dicts, typed arrays…), including ones in your entry script when its main code sits under `if __name__ == "__main__":` (or `if __FILE__ == $0`, or `if (import.meta.main)` / `if (require.main === module)`). In Python that means module-level functions and `@staticmethod`s, in Java, C# and PHP static methods (and PHP functions), in Go plain functions, in C and C++ free functions and static methods. `scan` says why anything else can't move yet.
+It ports top-level, deterministic functions that take plain data (numbers, strings, lists, dicts, typed arrays…), including ones in your entry script when its main code sits under `if __name__ == "__main__":` (or `if __FILE__ == $0`, or `if (import.meta.main)` / `if (require.main === module)`). In Python that means module-level functions and `@staticmethod`s (dataclasses and NamedTuples count as plain data), in Java, C# and PHP static methods (and PHP functions), in Go plain functions, in C and C++ free functions and static methods. `scan` says why anything else can't move yet.
 
 With Intel oneAPI on Windows, run fast-anything from a shell where `setvars.bat` ran (it sets up the linker). SYCL kernels run on the device and aren't ported; with `-fsycl`, only host functions are profiled and ported.
 

@@ -20,6 +20,39 @@ pub fn is_python(program: &str) -> bool {
     stem == "py" || stem.starts_with("python") || stem.starts_with("pypy")
 }
 
+/// Tools that run a command inside a project's virtualenv: `uv run app.py`, `poetry run python app.py`.
+const ENV_RUNNERS: &[&str] = &["uv", "poetry", "pipenv", "pdm", "hatch", "rye"];
+
+/// `uv run [python] app.py ...` (and the other ENV_RUNNERS) as `<the env's python> app.py ...`, so
+/// every later run uses the same interpreter and packages. `query` runs the runner's own python
+/// and returns what it prints. None when the command doesn't start with a runner.
+pub fn unwrap_env_runner(command: &[String], query: impl Fn(&[&str]) -> Result<String>) -> Result<Option<Vec<String>>> {
+    let runner = crate::util::program_stem(command.first().map(String::as_str).unwrap_or_default());
+    if !ENV_RUNNERS.contains(&runner.as_str()) || command.get(1).map(String::as_str) != Some("run") {
+        return Ok(None);
+    }
+    let mut rest = &command[2..];
+    if rest.first().is_some_and(|a| is_python(a)) {
+        rest = &rest[1..];
+    }
+    let shown = command[..2].join(" ");
+    match rest.first().map(String::as_str) {
+        None => bail!("name the script after {shown}, e.g.  fast-anything scan -- {shown} app.py"),
+        Some(a) if a.starts_with('-') && a != "-m" => bail!(
+            "fast-anything can't pass options to {shown}. Get its interpreter with  {shown} python -c \"import sys; print(sys.executable)\"  and scan with that: fast-anything scan -- <that python> app.py"
+        ),
+        Some(a) if a != "-m" && !a.ends_with(".py") => bail!(
+            "{a} isn't a .py script. Run the code it starts as  {shown} python -m <module>  or  {shown} python <script>.py"
+        ),
+        _ => {}
+    }
+    let mut ask = command[..2].iter().map(String::as_str).collect::<Vec<_>>();
+    ask.extend(["python", "-c", "import sys; print(sys.executable)"]);
+    let exe = query(&ask)?.trim().to_string();
+    ensure!(!exe.is_empty(), "{shown} didn't say which python it uses");
+    Ok(Some(std::iter::once(exe).chain(rest.iter().cloned()).collect()))
+}
+
 /// The absolute interpreter path behind python, python3, py, .venv/bin/python, ...
 pub fn resolve(program: &str, root: &Path) -> Result<String> {
     if !is_python(program) {
@@ -125,6 +158,11 @@ pub fn record(
 
 /// Rust type for a Python annotation, if there's an obvious one.
 pub fn rust_type(annotation: &str, owned: bool) -> Option<String> {
+    rust_type_in(annotation, owned, &|_| None)
+}
+
+/// rust_type, with `known` naming the Rust type for other names (structs generated for dataclasses).
+fn rust_type_in(annotation: &str, owned: bool, known: &dyn Fn(&str) -> Option<String>) -> Option<String> {
     let a: String = annotation.chars().filter(|c| !c.is_whitespace()).collect();
     let a = a.trim_start_matches("typing.");
     let inner = |prefix: &[&str]| {
@@ -133,7 +171,7 @@ pub fn rust_type(annotation: &str, owned: bool) -> Option<String> {
             .find_map(|p| a.strip_prefix(p).and_then(|r| r.strip_prefix('[')).and_then(|r| r.strip_suffix(']')))
     };
     if let Some(x) = a.strip_suffix("|None").or_else(|| a.strip_prefix("None|")).or_else(|| inner(&["Optional"])) {
-        return rust_type(x, owned).map(|t| format!("Option<{t}>"));
+        return rust_type_in(x, owned, known).map(|t| format!("Option<{t}>"));
     }
     Some(match a {
         "int" => "i64".into(),
@@ -147,14 +185,16 @@ pub fn rust_type(annotation: &str, owned: bool) -> Option<String> {
         "bytearray" => "&[u8]".into(),
         "None" if owned => "()".into(),
         _ => {
-            if let Some(x) = inner(&["list", "List", "Sequence"]) {
-                format!("Vec<{}>", rust_type(x, true)?)
+            if let Some(t) = known(a) {
+                t
+            } else if let Some(x) = inner(&["list", "List", "Sequence"]) {
+                format!("Vec<{}>", rust_type_in(x, true, known)?)
             } else if let Some(x) = inner(&["tuple", "Tuple"]) {
                 let raw_parts = split_top(x);
                 if raw_parts.len() == 2 && raw_parts[1].trim() == "..." {
-                    format!("Vec<{}>", rust_type(&raw_parts[0], true)?)
+                    format!("Vec<{}>", rust_type_in(&raw_parts[0], true, known)?)
                 } else {
-                    let parts: Option<Vec<String>> = raw_parts.iter().map(|p| rust_type(p, true)).collect();
+                    let parts: Option<Vec<String>> = raw_parts.iter().map(|p| rust_type_in(p, true, known)).collect();
                     let parts = parts?;
                     if parts.iter().any(|p| p == "...") {
                         return None;
@@ -166,10 +206,14 @@ pub fn rust_type(annotation: &str, owned: bool) -> Option<String> {
                 if kv.len() != 2 {
                     return None;
                 }
-                format!("std::collections::HashMap<{}, {}>", rust_type(&kv[0], true)?, rust_type(&kv[1], true)?)
+                format!(
+                    "std::collections::HashMap<{}, {}>",
+                    rust_type_in(&kv[0], true, known)?,
+                    rust_type_in(&kv[1], true, known)?
+                )
             } else {
                 let x = inner(&["set", "Set", "frozenset"])?;
-                format!("std::collections::HashSet<{}>", rust_type(x, true)?)
+                format!("std::collections::HashSet<{}>", rust_type_in(x, true, known)?)
             }
         }
     })
@@ -226,13 +270,90 @@ fn signature_default(p: &crate::hotspot::Param) -> Option<String> {
     p.default.as_deref().map(|d| rust_default(d).unwrap_or_else(|| "None".into()))
 }
 
+/// The annotation names this class (as a whole word: Point in list[Point], not in PointCloud).
+fn mentions(annotation: Option<&str>, class: &str) -> bool {
+    annotation.is_some_and(|a| a.split(|c: char| !c.is_alphanumeric() && c != '_').any(|w| w == class))
+}
+
+/// Rust name for the struct of a dataclass or NamedTuple: its own, unless that would hide a Rust
+/// prelude type (a NamedTuple called Box).
+fn struct_name(class: &str) -> String {
+    const PRELUDE: &[&str] = &[
+        "Box",
+        "Vec",
+        "String",
+        "Option",
+        "Some",
+        "None",
+        "Result",
+        "Ok",
+        "Err",
+        "Self",
+        "Copy",
+        "Clone",
+        "Send",
+        "Sync",
+        "Sized",
+        "Drop",
+        "Fn",
+        "FnMut",
+        "FnOnce",
+        "Default",
+        "Iterator",
+        "ToString",
+        "ToOwned",
+        "Into",
+        "From",
+        "AsRef",
+        "AsMut",
+        "Eq",
+        "PartialEq",
+        "Ord",
+        "PartialOrd",
+        "Extend",
+        "IntoIterator",
+        "Unpin",
+    ];
+    if PRELUDE.contains(&class) { format!("Py{class}") } else { class.to_string() }
+}
+
+/// `#[derive(FromPyObject)]` structs for the dataclasses and NamedTuples the parameters use, when
+/// every field has a Rust type; PyO3 reads them field by field, by attribute.
+/// Returns (Python class name, Rust struct definition).
+fn record_structs(hs: &Hotspot) -> Vec<(String, String)> {
+    let mut out = vec![];
+    let in_params = |name: &str| hs.params.iter().any(|p| mentions(p.annotation.as_deref(), name));
+    for (name, fields) in hs.records.iter().filter(|(name, _)| in_params(name)) {
+        let Some(types) =
+            fields.iter().map(|f| f.annotation.as_deref().and_then(|a| rust_type(a, true))).collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        let mut def = format!("#[derive(FromPyObject)]\n#[allow(dead_code)]\nstruct {} {{\n", struct_name(name));
+        for (f, ty) in fields.iter().zip(types) {
+            if ident(&f.name) != f.name {
+                def.push_str(&format!("    #[pyo3(attribute(\"{}\"))]\n", f.name));
+            }
+            def.push_str(&format!("    {}: {ty},\n", ident(&f.name)));
+        }
+        def.push_str("}\n\n");
+        out.push((name.clone(), def));
+    }
+    out
+}
+
 pub fn lib_rs(hs: &Hotspot, port: &Port) -> String {
+    let structs = record_structs(hs);
+    let known = |a: &str| structs.iter().any(|(name, _)| name == a).then(|| struct_name(a));
     let params: Vec<String> = hs
         .params
         .iter()
         .map(|p| {
-            let ty =
-                p.annotation.as_deref().and_then(|a| rust_type(a, false)).unwrap_or_else(|| "&Bound<'_, PyAny>".into());
+            let ty = p
+                .annotation
+                .as_deref()
+                .and_then(|a| rust_type_in(a, false, &known))
+                .unwrap_or_else(|| "&Bound<'_, PyAny>".into());
             let ty = if signature_default(p).as_deref() == Some("None") && !ty.starts_with("Option<") {
                 format!("Option<{ty}>")
             } else {
@@ -262,6 +383,7 @@ pub fn lib_rs(hs: &Hotspot, port: &Port) -> String {
          //! Replace the todo!() with a faithful, fast port. TASK.md has the original and real calls.\n\
          //! Check it with:  fast-anything verify {id}\n\n\
          use pyo3::prelude::*;\n\n\
+         {structs}\
          #[pyfunction]\n\
          {signature}\
          #[allow(unused_variables)]\n\
@@ -274,6 +396,7 @@ pub fn lib_rs(hs: &Hotspot, port: &Port) -> String {
         func = ident(&hs.name),
         params = params.join(", "),
         ext = port.ext,
+        structs = structs.iter().map(|(_, def)| def.as_str()).collect::<String>(),
     )
 }
 
@@ -326,6 +449,17 @@ fn py_value(v: &Value) -> String {
                 format!("__import__('base64').b64decode({s:?})")
             }
             Some((tag, Value::String(s))) if tag == "$float" => format!("float({s:?})"),
+            Some((tag, Value::Array(parts))) if tag == "$obj" && parts.len() == 3 => {
+                let class = parts[1].as_str().unwrap_or_default();
+                let fields: Vec<String> = parts[2]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|f| f.as_array().filter(|f| f.len() == 2))
+                    .map(|f| format!("{}={}", f[0].as_str().unwrap_or_default(), py_value(&f[1])))
+                    .collect();
+                format!("{}({})", class.rsplit('.').next().unwrap_or(class), fields.join(", "))
+            }
             _ => v.to_string(),
         },
     }
@@ -361,6 +495,25 @@ pub fn task_md(hs: &Hotspot, helpers: &[Hotspot], port: &Port, crate_dir: &Path)
     let mut notes = String::new();
     for w in &hs.warnings {
         notes.push_str(&format!("- Note: {w}.\n"));
+    }
+    let structs: Vec<String> = record_structs(hs).into_iter().map(|(name, _)| name).collect();
+    for (name, fields) in &hs.records {
+        let list: Vec<String> =
+            fields.iter().map(|f| format!("{}: {}", f.name, f.annotation.as_deref().unwrap_or("?"))).collect();
+        notes.push_str(&format!("- Note: `{name}` is a dataclass/NamedTuple in {} ({}).", hs.file, list.join(", ")));
+        if structs.contains(name) {
+            notes.push_str(&format!(
+                " As a parameter it arrives as the Rust struct `{}` in src/lib.rs.",
+                struct_name(name)
+            ));
+        }
+        if mentions(hs.returns.as_deref(), name) {
+            notes.push_str(&format!(
+                " The result must be a `{name}` too: get the class with `py.import(\"{}\")?.getattr(\"{name}\")?` and call it; verify checks the class and every field.",
+                hs.module.as_deref().unwrap_or_default()
+            ));
+        }
+        notes.push('\n');
     }
     for p in &hs.params {
         if let Some(d) = p.default.as_deref().filter(|d| rust_default(d).is_none()) {
@@ -525,6 +678,7 @@ mod tests {
             lang: crate::backend::Lang::Python,
             owner: None,
             line: 1,
+            sources: vec![],
         }
     }
 
@@ -692,6 +846,97 @@ mod tests {
                      assert best_pass(panics, [((), {})], 0.0) >= 0\n";
         let out = Command::new(python).args(["-I", "-c", check]).arg(&runner).output().unwrap();
         let _ = fs::remove_file(&runner);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[test]
+    fn env_runners_resolve_to_their_python() {
+        let cmd = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+        let query = |argv: &[&str]| -> Result<String> {
+            assert_eq!(&argv[1..], ["run", "python", "-c", "import sys; print(sys.executable)"]);
+            Ok(format!("/proj/.venv-{}/bin/python\n", argv[0]))
+        };
+        let got = |s: &str| unwrap_env_runner(&cmd(s), query);
+        assert_eq!(got("uv run app.py data.txt").unwrap().unwrap(), cmd("/proj/.venv-uv/bin/python app.py data.txt"));
+        assert_eq!(got("poetry run python app.py").unwrap().unwrap(), cmd("/proj/.venv-poetry/bin/python app.py"));
+        assert_eq!(got("pdm run python3 -m pkg").unwrap().unwrap(), cmd("/proj/.venv-pdm/bin/python -m pkg"));
+        assert!(got("python app.py").unwrap().is_none());
+        assert!(got("uv pip list").unwrap().is_none());
+        assert!(got("uv run --with numpy app.py").unwrap_err().to_string().contains("can't pass options"));
+        assert!(got("uv run pytest").unwrap_err().to_string().contains("isn't a .py script"));
+        assert!(got("uv run").is_err());
+    }
+
+    #[test]
+    fn dataclass_parameters_get_structs() {
+        use crate::hotspot::Param;
+        let field = |name: &str, annotation: &str| Param {
+            name: name.into(),
+            annotation: Some(annotation.into()),
+            ..Param::default()
+        };
+        let mut hs = Hotspot {
+            name: "closest".into(),
+            params: vec![
+                Param { name: "points".into(), annotation: Some("list[Point]".into()), ..Param::default() },
+                Param { name: "box".into(), annotation: Some("Box".into()), ..Param::default() },
+            ],
+            returns: Some("Stats".into()),
+            ..Hotspot::default()
+        };
+        hs.records.insert("Point".into(), vec![field("x", "float"), field("type", "str")]);
+        hs.records.insert("Box".into(), vec![field("lo", "float"), field("hi", "float")]);
+        hs.records.insert("Stats".into(), vec![field("n", "int")]);
+        hs.records.insert("Shape".into(), vec![field("p", "Polygon")]);
+        let lib = lib_rs(&hs, &port());
+        assert!(lib.contains("fn closest(points: Vec<Point>, r#box: PyBox) -> PyResult<Py<PyAny>>"), "{lib}");
+        assert!(lib.contains("struct PyBox {\n    lo: f64,\n    hi: f64,\n}"), "{lib}");
+        assert!(lib.contains("#[pyo3(attribute(\"type\"))]\n    r#type: String,"), "{lib}");
+        assert!(!lib.contains("struct Stats"), "only parameter types get a struct: {lib}");
+
+        let v: Value = serde_json::from_str(r#"{"$obj": ["geo", "Point", [["x", 1.5], ["type", "a"]]]}"#).unwrap();
+        assert_eq!(py_value(&v), r#"Point(x=1.5, type="a")"#);
+    }
+
+    #[test]
+    fn records_round_trip_in_the_runner() {
+        let Some(python) = ["python3", "python"]
+            .into_iter()
+            .find(|p| Command::new(p).arg("--version").output().is_ok_and(|o| o.status.success()))
+        else {
+            eprintln!("no python on PATH, skipping");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("fa-records-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("runner.py"), RUNNER).unwrap();
+        fs::write(
+            dir.join("geo.py"),
+            "from dataclasses import dataclass, field\nfrom typing import NamedTuple\n\n\
+             @dataclass(frozen=True)\nclass P:\n    x: float\n    y: float\n\n\
+             class B(NamedTuple):\n    lo: float\n    hi: float\n\n\
+             @dataclass\nclass C:\n    n: int\n    seen: int = field(init=False, default=0)\n\n\
+             def f(ps: list[P], b: B) -> C:\n    return C(len(ps))\n",
+        )
+        .unwrap();
+        let check = "import runpy, sys, os, json\n\
+                     d = sys.argv[1]; sys.path.insert(0, d)\n\
+                     ns = runpy.run_path(os.path.join(d, 'runner.py'))\n\
+                     enc, dec, same, edges, small, variants, describe = (ns[k] for k in ('enc', 'dec', 'same', 'edges', 'small', 'variants', 'describe'))\n\
+                     import geo, random\n\
+                     c = geo.C(3); object.__setattr__(c, 'seen', 7)\n\
+                     for v in (geo.P(1.0, 2.0), geo.B(0.0, 5.0), c, [geo.P(1.0, 2.0)]):\n\
+                     \x20   back = dec(json.loads(json.dumps(enc(v))))\n\
+                     \x20   assert same(v, back) and type(back) is type(v), (v, back)\n\
+                     assert enc(geo.B(0.0, 5.0))['$obj'][:2] == ['geo', 'B']\n\
+                     assert not same(geo.B(0.0, 5.0), (0.0, 5.0)) and not same(geo.P(1.0, 2.0), geo.P(1.0, 3.0))\n\
+                     b = geo.B(0.0, 5.0)\n\
+                     assert edges(b) == [] and small(b) is b and variants(b, random.Random(0)) == []\n\
+                     info = describe(os.path.join(d, 'geo.py'), 18, 'f', None, d)\n\
+                     assert set(info['records']) == {'P', 'B', 'C'}, info['records']\n\
+                     assert info['records']['C'] == [{'name': 'n', 'annotation': 'int'}, {'name': 'seen', 'annotation': 'int'}]\n";
+        let out = Command::new(python).args(["-I", "-c", check]).arg(&dir).output().unwrap();
+        let _ = fs::remove_dir_all(&dir);
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     }
 

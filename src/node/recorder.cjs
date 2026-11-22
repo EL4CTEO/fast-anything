@@ -76,7 +76,47 @@ globalThis.__fastAnythingWrap = (fn) =>
     return result;
   };
 
+// Each worker thread loads this too (workers inherit --require): it writes its calls next to the main
+// thread's files, and the main thread adds them in when the app exits.
+const { isMainThread, threadId } = require("node:worker_threads");
+const workerFile = (file, id) => `${file}.t${id}`;
+
+function write(outFile, metaFile) {
+  fs.writeFileSync(outFile, kept.map((c) => JSON.stringify(c)).join("\n") + (kept.length ? "\n" : ""));
+  fs.writeFileSync(metaFile, JSON.stringify({ calls, kept: kept.length, skipped, unsupported: [...unsupported], mutates }));
+}
+
+function workerIds() {
+  const dir = require("node:path").dirname(out);
+  const prefix = require("node:path").basename(workerFile(out, ""));
+  return fs.readdirSync(dir).filter((n) => n.startsWith(prefix)).map((n) => n.slice(prefix.length));
+}
+
+if (isMainThread) {
+  for (const id of workerIds()) for (const f of [workerFile(out, id), workerFile(meta, id)]) fs.rmSync(f, { force: true });
+}
+
 process.on("exit", () => {
-  fs.writeFileSync(out, kept.map((c) => JSON.stringify(c)).join("\n") + (kept.length ? "\n" : ""));
-  fs.writeFileSync(meta, JSON.stringify({ calls, kept: kept.length, skipped, unsupported: [...unsupported], mutates }));
+  if (!isMainThread) return write(workerFile(out, threadId), workerFile(meta, threadId));
+  for (const id of workerIds()) {
+    try {
+      const m = JSON.parse(fs.readFileSync(workerFile(meta, id), "utf8"));
+      const cases = fs.readFileSync(workerFile(out, id), "utf8").split("\n").filter((l) => l.trim()).map((l) => JSON.parse(l));
+      calls += m.calls;
+      skipped += m.skipped;
+      for (const u of m.unsupported) unsupported.add(u);
+      mutates = mutates || m.mutates;
+      kept.push(...cases);
+    } catch {} // a worker that was stopped before it finished writing
+    for (const f of [workerFile(out, id), workerFile(meta, id)]) fs.rmSync(f, { force: true });
+  }
+  if (kept.length > limit) {
+    // keep a sample of `limit` calls across all threads
+    for (let i = 0; i < limit; i++) {
+      const j = i + rand(kept.length - i);
+      [kept[i], kept[j]] = [kept[j], kept[i]];
+    }
+    kept.length = limit;
+  }
+  write(out, meta);
 });

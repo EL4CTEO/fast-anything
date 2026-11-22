@@ -161,7 +161,19 @@ function describe(file, line0, name, entry, root) {
       blockers.push("lives in the entry script, which runs on import: put its main code under if (import.meta.main) (or require.main === module)");
     else if (lineStart > guard) blockers.push("defined inside or after the if (import.meta.main) block");
   }
-  if (kind === "method" || indent > 0) blockers.push("method or nested function (top-level functions only for now)");
+  // a static method directly in the body of a top-level class is called as Class.name(...), like a function
+  let owner = null;
+  if (kind === "method" && m[2]) {
+    for (const c of code.matchAll(new RegExp("^(?:export\\s+)?(?:default\\s+)?class\\s+(" + IDENT + ")[^{]*\\{", "gm"))) {
+      const body = c.index + c[0].length - 1;
+      if (body > lineStart || matching(code, body) < close) continue;
+      let depth = 0;
+      for (const ch of code.slice(body, lineStart)) depth += ch === "{" ? 1 : ch === "}" ? -1 : 0;
+      if (depth === 1) owner = c[1];
+    }
+  }
+  if ((kind === "method" && !owner) || (kind !== "method" && indent > 0))
+    blockers.push("method or nested function (top-level functions and static methods only for now)");
   if (kind === "function" && m[4]) blockers.push("async");
   if (kind === "function" && m[5]) blockers.push("generator (function*)");
   if (kind === "binding" && m[5]) blockers.push("async");
@@ -207,8 +219,9 @@ function describe(file, line0, name, entry, root) {
     factor *= 0.9;
   }
   return {
-    qualname: name,
+    qualname: owner ? owner + "." + name : name,
     module,
+    owner,
     kind: kind === "method" || indent > 0 ? "method" : "function",
     end_line: src.slice(0, bodyEnd + 1).split("\n").length,
     params: params.map(({ name, annotation }) => ({ name, annotation })),
@@ -232,31 +245,33 @@ function projectRelative(root, file) {
 
 function profile(job) {
   const names = readdirSync(job.dir).filter((f) => f.endsWith(".cpuprofile"));
-  if (!names.length) throw new Error("node wrote no .cpuprofile");
-  names.sort((a, b) => statSync(path.join(job.dir, b)).size - statSync(path.join(job.dir, a)).size);
-  const prof = JSON.parse(readFileSync(path.join(job.dir, names[0]), "utf8"));
-
-  const byId = new Map(prof.nodes.map((n) => [n.id, n]));
-  const parent = new Map();
-  for (const n of prof.nodes) for (const c of n.children || []) parent.set(c, n.id);
-  const selfUs = new Map();
-  prof.samples.forEach((id, i) => selfUs.set(id, (selfUs.get(id) || 0) + (prof.timeDeltas[i] || 0)));
-  const total = (prof.endTime - prof.startTime) / 1e6;
-
+  if (!names.length) throw new Error("the runtime wrote no .cpuprofile (Bun and Deno need a version with --cpu-prof)");
+  // one profile per thread (worker_threads) and process: add them all up. The run took as long as
+  // the longest one, the main thread's.
   const key = (n) => `${n.callFrame.url}:${n.callFrame.lineNumber}:${n.callFrame.columnNumber}:${n.callFrame.functionName}`;
   const funcs = new Map();
-  for (const n of prof.nodes) if (!funcs.has(key(n))) funcs.set(key(n), { frame: n.callFrame, self: 0, cum: 0 });
-  for (const [id, us] of selfUs) {
-    let node = byId.get(id);
-    funcs.get(key(node)).self += us;
-    const seen = new Set();
-    while (node) {
-      const k = key(node);
-      if (!seen.has(k)) {
-        seen.add(k);
-        funcs.get(k).cum += us;
+  let total = 0;
+  for (const name of names) {
+    const prof = JSON.parse(readFileSync(path.join(job.dir, name), "utf8"));
+    total = Math.max(total, (prof.endTime - prof.startTime) / 1e6);
+    const byId = new Map(prof.nodes.map((n) => [n.id, n]));
+    const parent = new Map();
+    for (const n of prof.nodes) for (const c of n.children || []) parent.set(c, n.id);
+    const selfUs = new Map();
+    prof.samples.forEach((id, i) => selfUs.set(id, (selfUs.get(id) || 0) + (prof.timeDeltas[i] || 0)));
+    for (const n of prof.nodes) if (!funcs.has(key(n))) funcs.set(key(n), { frame: n.callFrame, self: 0, cum: 0 });
+    for (const [id, us] of selfUs) {
+      let node = byId.get(id);
+      funcs.get(key(node)).self += us;
+      const seen = new Set();
+      while (node) {
+        const k = key(node);
+        if (!seen.has(k)) {
+          seen.add(k);
+          funcs.get(k).cum += us;
+        }
+        node = byId.get(parent.get(node.id));
       }
-      node = byId.get(parent.get(node.id));
     }
   }
 

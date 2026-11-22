@@ -209,6 +209,9 @@ pub fn status(ctx: &Ctx) {
             .map(|m| format!("{} per call", times(m.speedup)))
             .unwrap_or_default();
         ui::line(format!("  {}  {}  {}", pad(&p.id, 32), state, dim(speed)));
+        if ctx.stale(p) {
+            ui::line(format!("  {}  {}", pad("", 32), red(format!("! {} changed since it was recorded", p.file))));
+        }
     }
     if let Some(b) = &s.bench {
         ui::line("");

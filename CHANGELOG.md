@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.0
+
+- JavaScript/TypeScript apps also run on Bun and Deno (#55); `doctor` checks them.
+- Node.js: `worker_threads` are profiled and recorded too (#53).
+- Warns when the original changed since its port was recorded (#29).
+- `disable --all` switches every port back at once (#41).
+- Python: `scan` runs through `uv run`, `poetry run` and other env runners (#34).
+
+Thanks @mohitmishra786.
+
 ## 0.6.2
 
 - npm: the launcher sets the binary's execute bit, fixing `EACCES` on macOS and Linux (#27, thanks @podsni).
