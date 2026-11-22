@@ -93,7 +93,15 @@ impl Lang {
     pub fn c_bridge(self) -> bool {
         matches!(
             self,
-            Lang::Ruby | Lang::Java | Lang::Go | Lang::Php | Lang::C | Lang::Cpp | Lang::CSharp | Lang::Kotlin | Lang::R
+            Lang::Ruby
+                | Lang::Java
+                | Lang::Go
+                | Lang::Php
+                | Lang::C
+                | Lang::Cpp
+                | Lang::CSharp
+                | Lang::Kotlin
+                | Lang::R
         )
     }
 
@@ -252,9 +260,15 @@ impl Lang {
             Lang::Python => format!("{ext}.abi3.so"),
             Lang::Node => format!("{ext}.node"),
             // loaded through a C FFI (Fiddle, FFM, ...): the platform's own library name
-            Lang::Ruby | Lang::Java | Lang::Go | Lang::Php | Lang::C | Lang::Cpp | Lang::CSharp | Lang::Kotlin | Lang::R => {
-                built.clone()
-            }
+            Lang::Ruby
+            | Lang::Java
+            | Lang::Go
+            | Lang::Php
+            | Lang::C
+            | Lang::Cpp
+            | Lang::CSharp
+            | Lang::Kotlin
+            | Lang::R => built.clone(),
         };
         (built, dest)
     }
