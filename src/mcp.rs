@@ -114,6 +114,24 @@ fn call(params: &Value) -> Result<Value> {
     })
 }
 
+/// Sends each step of a long tool call (profiling, recording, building...) as a progress
+/// notification, for clients that asked with a progressToken.
+fn progress_notifier(token: Value) -> Box<dyn FnMut(&str) + Send> {
+    let mut progress = 0u64;
+    Box::new(move |message: &str| {
+        progress += 1;
+        let note = progress_note(&token, progress, message);
+        let mut stdout = std::io::stdout().lock();
+        let _ = writeln!(stdout, "{note}");
+        let _ = stdout.flush();
+    })
+}
+
+fn progress_note(token: &Value, progress: u64, message: &str) -> Value {
+    json!({ "jsonrpc": "2.0", "method": "notifications/progress",
+            "params": { "progressToken": token, "progress": progress, "message": message } })
+}
+
 fn handle(msg: &Value) -> Option<Value> {
     let id = msg.get("id")?.clone();
     let params = &msg["params"];
@@ -126,12 +144,20 @@ fn handle(msg: &Value) -> Option<Value> {
         }),
         "ping" => json!({}),
         "tools/list" => json!({ "tools": tools() }),
-        "tools/call" => match call(params) {
-            Ok(v) => {
-                json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&v).unwrap_or_default() }] })
+        "tools/call" => {
+            let token = &params["_meta"]["progressToken"];
+            if token.is_string() || token.is_number() {
+                ui::set_progress(Some(progress_notifier(token.clone())));
             }
-            Err(e) => json!({ "content": [{ "type": "text", "text": format!("{e:#}") }], "isError": true }),
-        },
+            let result = call(params);
+            ui::set_progress(None);
+            match result {
+                Ok(v) => {
+                    json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&v).unwrap_or_default() }] })
+                }
+                Err(e) => json!({ "content": [{ "type": "text", "text": format!("{e:#}") }], "isError": true }),
+            }
+        }
         method => {
             return Some(
                 json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": format!("unknown method {method}") } }),
@@ -177,5 +203,26 @@ mod tests {
         assert!(handle(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })).is_none());
         let bad = handle(&json!({ "jsonrpc": "2.0", "id": 3, "method": "nope" })).unwrap();
         assert_eq!(bad["error"]["code"], -32601);
+    }
+
+    #[test]
+    fn steps_become_progress_notifications() {
+        let note = progress_note(&json!("tok-1"), 2, "building fa_fuzzy (release)");
+        assert_eq!(note["method"], "notifications/progress");
+        assert_eq!(
+            note["params"],
+            json!({ "progressToken": "tok-1", "progress": 2, "message": "building fa_fuzzy (release)" })
+        );
+        assert!(note.get("id").is_none(), "a notification has no id");
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        ui::set_quiet(true);
+        ui::set_progress(Some(Box::new(move |m: &str| sink.lock().unwrap().push(m.to_string()))));
+        ui::step("profiling python app.py");
+        ui::set_progress(None);
+        ui::step("not reported");
+        let seen = seen.lock().unwrap();
+        assert!(seen.iter().any(|m| m == "profiling python app.py") && !seen.iter().any(|m| m == "not reported"));
     }
 }
