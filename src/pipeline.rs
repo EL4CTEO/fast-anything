@@ -141,6 +141,7 @@ pub fn verify(root: &Path, id: Option<&str>) -> Result<(String, Verify)> {
     let mut ctx = Ctx::open(root)?;
     let id = ctx.resolve_port(id)?;
     let port = ctx.state.ports[&id].clone();
+    let source_hash = backend::source_hash(&ctx.crate_dir(&port))?;
     ui::step(format!("building {} (release)", ui::bold(&port.ext)));
     let v = match backend::build(&ctx, &port)? {
         Err(log) => Verify { built: false, build_log: Some(log), ..Verify::default() },
@@ -155,6 +156,7 @@ pub fn verify(root: &Path, id: Option<&str>) -> Result<(String, Verify)> {
     };
     let mut v = v;
     v.lang = port.lang;
+    v.source_hash = Some(source_hash);
     if !v.ok() && port.enabled {
         port.lang.disable(&ctx, &port)?;
         if let Some(p) = ctx.state.ports.get_mut(&id) {
@@ -210,6 +212,18 @@ pub fn build_all(root: &Path) -> Result<()> {
     ensure!(!ctx.state.ports.is_empty(), "nothing ported yet");
     let mut failed = 0;
     for port in ctx.state.ports.values() {
+        // An enabled port loads whatever lands in .fast/lib: only rebuild what verify checked.
+        let verified = port.verify.as_ref().and_then(|v| v.source_hash.as_deref());
+        if port.enabled
+            && verified.is_some_and(|h| backend::source_hash(&ctx.crate_dir(port)).ok().as_deref() != Some(h))
+        {
+            failed += 1;
+            ui::error(format!(
+                "{} is switched on and its Rust changed since it passed verify; run  fast-anything verify {}",
+                port.id, port.id
+            ));
+            continue;
+        }
         ui::step(format!("building {}", ui::bold(&port.id)));
         match backend::build(&ctx, port)? {
             Ok(path) => ui::ok(format!("{}", path.display())),

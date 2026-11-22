@@ -265,6 +265,32 @@ pub fn build(ctx: &Ctx, port: &Port) -> Result<std::result::Result<PathBuf, Stri
     Ok(Ok(dest))
 }
 
+/// FNV-1a over the crate's Cargo.toml and everything under src/, so build can tell whether the
+/// sources are still the ones verify checked. Stable across Rust versions, unlike DefaultHasher.
+pub fn source_hash(dir: &Path) -> Result<String> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+        for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+            let path = entry?.path();
+            if path.is_dir() { walk(&path, out)? } else { out.push(path) }
+        }
+        Ok(())
+    }
+    let mut files = vec![dir.join("Cargo.toml")];
+    if dir.join("src").is_dir() {
+        walk(&dir.join("src"), &mut files)?;
+    }
+    files.sort();
+    let mut h: u64 = 0xcbf29ce484222325;
+    for file in &files {
+        let rel = file.strip_prefix(dir).unwrap_or(file).to_string_lossy().replace('\\', "/");
+        let bytes = fs::read(file).with_context(|| format!("reading {}", file.display()))?;
+        for b in rel.bytes().chain([0]).chain(bytes).chain([0]) {
+            h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+        }
+    }
+    Ok(format!("{h:016x}"))
+}
+
 // ------------------------------------------------------------------ marked blocks
 
 pub fn markers(comment: &str, id: &str) -> (String, String) {
@@ -331,6 +357,21 @@ pub fn line_starting(text: &str, prefixes: &[&str]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_hash_follows_the_sources() {
+        let dir = std::env::temp_dir().join(format!("fa-hash-test-{}", std::process::id()));
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap();
+        fs::write(dir.join("src/lib.rs"), "fn f() {}\n").unwrap();
+        let first = source_hash(&dir).unwrap();
+        assert_eq!(source_hash(&dir).unwrap(), first);
+        fs::write(dir.join("TASK.md"), "not a source").unwrap();
+        assert_eq!(source_hash(&dir).unwrap(), first, "only Cargo.toml and src/ count");
+        fs::write(dir.join("src/lib.rs"), "fn f() { }\n").unwrap();
+        assert_ne!(source_hash(&dir).unwrap(), first);
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn blocks_come_out_byte_for_byte() {

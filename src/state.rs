@@ -68,6 +68,8 @@ pub struct Verify {
     pub failures: Vec<Failure>,
     pub micro: Option<Micro>,
     pub lang: Lang,
+    /// Hash of the crate's sources this result is for (see backend::source_hash).
+    pub source_hash: Option<String>,
 }
 
 impl Verify {
