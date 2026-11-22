@@ -296,6 +296,7 @@ fn py_value(v: &Value) -> String {
                 let inner: Vec<String> = items.iter().map(py_value).collect();
                 if inner.len() == 1 { format!("({},)", inner[0]) } else { format!("({})", inner.join(", ")) }
             }
+            Some((tag, Value::Array(items))) if tag == "$set" && items.is_empty() => "set()".into(),
             Some((tag, Value::Array(items))) if tag == "$set" => {
                 format!("{{{}}}", items.iter().map(py_value).collect::<Vec<_>>().join(", "))
             }
@@ -551,6 +552,8 @@ mod tests {
             py_value(&v),
             r#"[None, True, "a", __import__('base64').b64decode("aGVsbG8="), (1, 2), {"k": 1.5}]"#
         );
+        let sets: Value = serde_json::from_str(r#"[{"$set": []}, {"$set": [1]}, {"$dict": []}]"#).unwrap();
+        assert_eq!(py_value(&sets), "[set(), {1}, {}]");
     }
 
     #[test]
