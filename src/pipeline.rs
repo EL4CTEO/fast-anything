@@ -24,6 +24,13 @@ pub fn scan(root: &Path, command: Vec<String>) -> Result<ScanOut> {
         "put the command that runs your app after --, e.g.  fast-anything scan -- python app.py"
     );
     let mut ctx = Ctx::open(root)?;
+    let command = match crate::python::unwrap_env_runner(&command, |argv| env_runner_output(&ctx.root, argv))? {
+        Some(unwrapped) => {
+            ui::step(format!("{} runs {}", ui::bold(command[..2].join(" ")), ui::bold(&unwrapped[0])));
+            unwrapped
+        }
+        None => command,
+    };
     let lang = crate::cfamily::refine(Lang::detect(&command[0])?, &command[1..]);
     let exe = lang.resolve(&command[0], &ctx.root)?;
     ui::step(format!("profiling {}", ui::bold(command.join(" "))));
@@ -37,6 +44,13 @@ pub fn scan(root: &Path, command: Vec<String>) -> Result<ScanOut> {
     ctx.state.hotspots = hotspots.clone();
     ctx.save()?;
     Ok(ScanOut { command, wall: profile.wall, hotspots })
+}
+
+/// What an env runner (uv, poetry, ...) prints for a command run in the project.
+fn env_runner_output(root: &Path, argv: &[&str]) -> Result<String> {
+    let out = util::output(std::process::Command::new(argv[0]).args(&argv[1..]).current_dir(root), argv[0])?;
+    ensure!(out.status.success(), "{} failed:\n{}", argv.join(" "), util::tail(&util::combined(&out), 10));
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 fn pick<'a>(hotspots: &'a [Hotspot], id: Option<&str>) -> Result<&'a Hotspot> {

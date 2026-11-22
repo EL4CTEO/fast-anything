@@ -45,6 +45,19 @@ pub struct Recording {
     pub mutates: bool,
 }
 
+/// Launchers that can't be unwrapped the way uv run or poetry run are (see python::unwrap_env_runner).
+fn wrapper_hint(program: &str) -> Option<&'static str> {
+    Some(match crate::util::program_stem(program).as_str() {
+        "tsx" | "ts-node" | "npx" => {
+            "Node.js 22.6+ runs TypeScript itself, and fast-anything needs node to start the app:\n    fast-anything scan -- node app.ts"
+        }
+        "bundle" => {
+            "bundle exec sets up gems for its own process only. Scan with ruby directly, and if the app needs Bundler, put  require \"bundler/setup\"  at the top of its script:\n    fast-anything scan -- ruby app.rb"
+        }
+        _ => return None,
+    })
+}
+
 impl Lang {
     pub fn detect(program: &str) -> Result<Lang> {
         if python::is_python(program) {
@@ -63,6 +76,8 @@ impl Lang {
             Ok(Lang::CSharp)
         } else if let Some(lang) = cfamily::detect(program) {
             Ok(lang)
+        } else if let Some(hint) = wrapper_hint(program) {
+            bail!("{hint}")
         } else {
             bail!(
                 "fast-anything speaks Python, Node.js (JavaScript/TypeScript), Ruby, Java, Go, PHP, C, C++ and C#. Start the command with one of them:\n    fast-anything scan -- python app.py\n    fast-anything scan -- node app.js\n    fast-anything scan -- ruby app.rb\n    fast-anything scan -- java App.java\n    fast-anything scan -- go run .\n    fast-anything scan -- php app.php\n    fast-anything scan -- clang -O2 main.c  (or gcc, g++, clang++, icpx)\n    fast-anything scan -- dotnet run -c Release"
@@ -371,6 +386,14 @@ mod tests {
         fs::write(dir.join("src/lib.rs"), "fn f() { }\n").unwrap();
         assert_ne!(source_hash(&dir).unwrap(), first);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn launchers_get_a_hint() {
+        assert!(Lang::detect("npx").unwrap_err().to_string().contains("node app.ts"));
+        assert!(Lang::detect("tsx").unwrap_err().to_string().contains("node app.ts"));
+        assert!(Lang::detect("bundle").unwrap_err().to_string().contains("bundler/setup"));
+        assert!(Lang::detect("cobol").unwrap_err().to_string().starts_with("fast-anything speaks"));
     }
 
     #[test]

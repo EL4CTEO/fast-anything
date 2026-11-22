@@ -20,6 +20,39 @@ pub fn is_python(program: &str) -> bool {
     stem == "py" || stem.starts_with("python") || stem.starts_with("pypy")
 }
 
+/// Tools that run a command inside a project's virtualenv: `uv run app.py`, `poetry run python app.py`.
+const ENV_RUNNERS: &[&str] = &["uv", "poetry", "pipenv", "pdm", "hatch", "rye"];
+
+/// `uv run [python] app.py ...` (and the other ENV_RUNNERS) as `<the env's python> app.py ...`, so
+/// every later run uses the same interpreter and packages. `query` runs the runner's own python
+/// and returns what it prints. None when the command doesn't start with a runner.
+pub fn unwrap_env_runner(command: &[String], query: impl Fn(&[&str]) -> Result<String>) -> Result<Option<Vec<String>>> {
+    let runner = crate::util::program_stem(command.first().map(String::as_str).unwrap_or_default());
+    if !ENV_RUNNERS.contains(&runner.as_str()) || command.get(1).map(String::as_str) != Some("run") {
+        return Ok(None);
+    }
+    let mut rest = &command[2..];
+    if rest.first().is_some_and(|a| is_python(a)) {
+        rest = &rest[1..];
+    }
+    let shown = command[..2].join(" ");
+    match rest.first().map(String::as_str) {
+        None => bail!("name the script after {shown}, e.g.  fast-anything scan -- {shown} app.py"),
+        Some(a) if a.starts_with('-') && a != "-m" => bail!(
+            "fast-anything can't pass options to {shown}. Get its interpreter with  {shown} python -c \"import sys; print(sys.executable)\"  and scan with that: fast-anything scan -- <that python> app.py"
+        ),
+        Some(a) if a != "-m" && !a.ends_with(".py") => bail!(
+            "{a} isn't a .py script. Run the code it starts as  {shown} python -m <module>  or  {shown} python <script>.py"
+        ),
+        _ => {}
+    }
+    let mut ask = command[..2].iter().map(String::as_str).collect::<Vec<_>>();
+    ask.extend(["python", "-c", "import sys; print(sys.executable)"]);
+    let exe = query(&ask)?.trim().to_string();
+    ensure!(!exe.is_empty(), "{shown} didn't say which python it uses");
+    Ok(Some(std::iter::once(exe).chain(rest.iter().cloned()).collect()))
+}
+
 /// The absolute interpreter path behind python, python3, py, .venv/bin/python, ...
 pub fn resolve(program: &str, root: &Path) -> Result<String> {
     if !is_python(program) {
@@ -693,6 +726,24 @@ mod tests {
         let out = Command::new(python).args(["-I", "-c", check]).arg(&runner).output().unwrap();
         let _ = fs::remove_file(&runner);
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[test]
+    fn env_runners_resolve_to_their_python() {
+        let cmd = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+        let query = |argv: &[&str]| -> Result<String> {
+            assert_eq!(&argv[1..], ["run", "python", "-c", "import sys; print(sys.executable)"]);
+            Ok(format!("/proj/.venv-{}/bin/python\n", argv[0]))
+        };
+        let got = |s: &str| unwrap_env_runner(&cmd(s), query);
+        assert_eq!(got("uv run app.py data.txt").unwrap().unwrap(), cmd("/proj/.venv-uv/bin/python app.py data.txt"));
+        assert_eq!(got("poetry run python app.py").unwrap().unwrap(), cmd("/proj/.venv-poetry/bin/python app.py"));
+        assert_eq!(got("pdm run python3 -m pkg").unwrap().unwrap(), cmd("/proj/.venv-pdm/bin/python -m pkg"));
+        assert!(got("python app.py").unwrap().is_none());
+        assert!(got("uv pip list").unwrap().is_none());
+        assert!(got("uv run --with numpy app.py").unwrap_err().to_string().contains("can't pass options"));
+        assert!(got("uv run pytest").unwrap_err().to_string().contains("isn't a .py script"));
+        assert!(got("uv run").is_err());
     }
 
     #[test]
