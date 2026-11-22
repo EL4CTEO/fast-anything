@@ -81,7 +81,12 @@ enum Cmd {
         samples: usize,
     },
     /// Build the Rust port and replay every recorded call against it
-    Verify { id: Option<String> },
+    Verify {
+        id: Option<String>,
+        /// Verify every port (after a toolchain or dependency upgrade, or changes to the app)
+        #[arg(long, conflicts_with = "id")]
+        all: bool,
+    },
     /// Switch your app over to the verified Rust port
     Enable {
         id: Option<String>,
@@ -152,7 +157,8 @@ fn run(cmd: Cmd, root: &Path) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Verify { id } => {
+        Cmd::Verify { all: true, .. } => pipeline::verify_all(root),
+        Cmd::Verify { id, .. } => {
             let (id, v) = pipeline::verify(root, id.as_deref())?;
             show::verify(&id, &v);
             if !v.ok() {
@@ -190,5 +196,21 @@ fn run(cmd: Cmd, root: &Path) -> Result<()> {
         }
         Cmd::Doctor => doctor::run(),
         Cmd::Mcp | Cmd::Replay { .. } => unreachable!(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_all_parses() {
+        let cli = Cli::try_parse_from(["fast-anything", "verify", "--all"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Verify { all: true, id: None }));
+        assert!(Cli::try_parse_from(["fast-anything", "verify", "fuzzy.lev", "--all"]).is_err(), "an id or --all");
+        assert!(matches!(
+            Cli::try_parse_from(["fast-anything", "verify"]).unwrap().cmd,
+            Cmd::Verify { all: false, .. }
+        ));
     }
 }

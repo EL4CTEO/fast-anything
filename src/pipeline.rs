@@ -169,6 +169,23 @@ pub fn verify(root: &Path, id: Option<&str>) -> Result<(String, Verify)> {
     Ok((id, v))
 }
 
+/// Verify every port; an enabled one that fails is switched back, as with a single verify.
+pub fn verify_all(root: &Path) -> Result<()> {
+    let ids: Vec<String> = Ctx::open(root)?.state.ports.keys().cloned().collect();
+    ensure!(!ids.is_empty(), "nothing ported yet: run  fast-anything port");
+    let mut failed = vec![];
+    for id in &ids {
+        let (id, v) = verify(root, Some(id))?;
+        show::verify(&id, &v);
+        if !v.ok() {
+            failed.push(id);
+        }
+    }
+    ensure!(failed.is_empty(), "{} of {} ports don't match: {}", failed.len(), ids.len(), failed.join(", "));
+    ui::ok(format!("all {} ports match the original", ids.len()));
+    Ok(())
+}
+
 /// What to do about a port that's right but slower than the original.
 pub fn slower_hint() -> &'static str {
     "calling into Rust costs more than this function's work, so it won't be switched on. Port its caller instead (fewer, bigger calls), or  enable --force"
