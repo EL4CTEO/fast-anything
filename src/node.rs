@@ -558,6 +558,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn worker_threads_are_recorded() {
+        if !Command::new("node").arg("--version").output().is_ok_and(|o| o.status.success()) {
+            eprintln!("no node on PATH, skipping");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("fa-node-workers-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("recorder.cjs"), RECORDER).unwrap();
+        fs::write(
+            dir.join("lib.cjs"),
+            "function sq(x) {\n  return x * x;\n}\nsq = globalThis.__fastAnythingWrap ? globalThis.__fastAnythingWrap(sq) : sq;\nmodule.exports = { sq };\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("app.cjs"),
+            "const { Worker, isMainThread, parentPort } = require(\"node:worker_threads\");\n\
+             const { sq } = require(\"./lib.cjs\");\n\
+             if (isMainThread) {\n\
+             \x20 sq(1);\n\
+             \x20 for (let i = 0; i < 2; i++) new Worker(__filename).on(\"message\", (m) => console.log(m));\n\
+             } else {\n\
+             \x20 let t = 0;\n\
+             \x20 for (let i = 0; i < 5; i++) t += sq(i);\n\
+             \x20 parentPort.postMessage(t);\n\
+             }\n",
+        )
+        .unwrap();
+        let out = Command::new("node")
+            .args(["--require", "./recorder.cjs", "app.cjs"])
+            .current_dir(&dir)
+            .env("FAST_ANYTHING_RECORD_OUT", dir.join("rec.jsonl"))
+            .env("FAST_ANYTHING_RECORD_META", dir.join("rec.meta.json"))
+            .env("FAST_ANYTHING_RECORD_LIMIT", "500")
+            .output()
+            .unwrap();
+        let meta = fs::read_to_string(dir.join("rec.meta.json")).unwrap_or_default();
+        let lines = fs::read_to_string(dir.join("rec.jsonl")).unwrap_or_default().lines().count();
+        let leftovers = fs::read_dir(&dir)
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().contains(".t"))
+            .count();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let meta: Value = serde_json::from_str(&meta).unwrap();
+        assert_eq!((meta["calls"].clone(), lines), (json!(11), 11), "1 call in the main thread, 5 in each worker");
+        assert_eq!(leftovers, 0, "worker files are absorbed and removed");
+    }
+
+    #[test]
     fn maps_typescript() {
         assert_eq!(rust_type("number").as_deref(), Some("f64"));
         assert_eq!(rust_type("string[]").as_deref(), Some("Vec<String>"));

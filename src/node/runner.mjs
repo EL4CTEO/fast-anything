@@ -233,30 +233,32 @@ function projectRelative(root, file) {
 function profile(job) {
   const names = readdirSync(job.dir).filter((f) => f.endsWith(".cpuprofile"));
   if (!names.length) throw new Error("node wrote no .cpuprofile");
-  names.sort((a, b) => statSync(path.join(job.dir, b)).size - statSync(path.join(job.dir, a)).size);
-  const prof = JSON.parse(readFileSync(path.join(job.dir, names[0]), "utf8"));
-
-  const byId = new Map(prof.nodes.map((n) => [n.id, n]));
-  const parent = new Map();
-  for (const n of prof.nodes) for (const c of n.children || []) parent.set(c, n.id);
-  const selfUs = new Map();
-  prof.samples.forEach((id, i) => selfUs.set(id, (selfUs.get(id) || 0) + (prof.timeDeltas[i] || 0)));
-  const total = (prof.endTime - prof.startTime) / 1e6;
-
+  // one profile per thread (worker_threads) and process: add them all up. The run took as long as
+  // the longest one, the main thread's.
   const key = (n) => `${n.callFrame.url}:${n.callFrame.lineNumber}:${n.callFrame.columnNumber}:${n.callFrame.functionName}`;
   const funcs = new Map();
-  for (const n of prof.nodes) if (!funcs.has(key(n))) funcs.set(key(n), { frame: n.callFrame, self: 0, cum: 0 });
-  for (const [id, us] of selfUs) {
-    let node = byId.get(id);
-    funcs.get(key(node)).self += us;
-    const seen = new Set();
-    while (node) {
-      const k = key(node);
-      if (!seen.has(k)) {
-        seen.add(k);
-        funcs.get(k).cum += us;
+  let total = 0;
+  for (const name of names) {
+    const prof = JSON.parse(readFileSync(path.join(job.dir, name), "utf8"));
+    total = Math.max(total, (prof.endTime - prof.startTime) / 1e6);
+    const byId = new Map(prof.nodes.map((n) => [n.id, n]));
+    const parent = new Map();
+    for (const n of prof.nodes) for (const c of n.children || []) parent.set(c, n.id);
+    const selfUs = new Map();
+    prof.samples.forEach((id, i) => selfUs.set(id, (selfUs.get(id) || 0) + (prof.timeDeltas[i] || 0)));
+    for (const n of prof.nodes) if (!funcs.has(key(n))) funcs.set(key(n), { frame: n.callFrame, self: 0, cum: 0 });
+    for (const [id, us] of selfUs) {
+      let node = byId.get(id);
+      funcs.get(key(node)).self += us;
+      const seen = new Set();
+      while (node) {
+        const k = key(node);
+        if (!seen.has(k)) {
+          seen.add(k);
+          funcs.get(k).cum += us;
+        }
+        node = byId.get(parent.get(node.id));
       }
-      node = byId.get(parent.get(node.id));
     }
   }
 
