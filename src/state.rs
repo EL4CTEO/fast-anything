@@ -83,16 +83,35 @@ fn forms(source: &str) -> [String; 3] {
     [source.replacen("const ", "let ", 1), source.replacen("let ", "const ", 1), source]
 }
 
+/// The file without fast-anything's own marked blocks: an enabled Java, Go, C#, C/C++, PHP or
+/// Kotlin port puts one inside the function's body, and that isn't a change to the original.
+fn without_blocks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut inside = false;
+    for line in text.split_inclusive('\n') {
+        if !inside && line.contains(">>> fast-anything: ") {
+            inside = true;
+        }
+        if !inside {
+            out.push_str(line);
+        }
+        if inside && line.contains("<<< fast-anything: ") {
+            inside = false;
+        }
+    }
+    out
+}
+
 /// The source appears in the file as whole lines.
 fn found(text: &str, source: &str) -> bool {
-    let text = format!("\n{}\n", text.replace("\r\n", "\n"));
+    let text = format!("\n{}\n", without_blocks(text).replace("\r\n", "\n"));
     forms(source).iter().any(|s| text.contains(&format!("\n{}\n", s.trim_end_matches('\n'))))
 }
 
 /// The sources that start a line in the file, each extended to the end of its last line so that
 /// found() can match it as whole lines (see Port::sources).
 pub fn verbatim(text: &str, sources: &[&str]) -> Vec<String> {
-    let text = format!("\n{}\n", text.replace("\r\n", "\n"));
+    let text = format!("\n{}\n", without_blocks(text).replace("\r\n", "\n"));
     sources
         .iter()
         .filter(|s| !s.trim().is_empty())
@@ -227,6 +246,16 @@ mod tests {
         assert!(!v(1.4).slower());
         assert!(!v(0.0).slower(), "no measurement isn't slower");
         assert!(!Verify::default().slower());
+    }
+
+    #[test]
+    fn blocks_in_the_body_are_not_changes() {
+        let original = "static int lev(String a) {\n    return a.length();\n}\n";
+        let kept = verbatim(original, &["static int lev(String a) {\n    return a.length();\n}"]);
+        let enabled = "static int lev(String a) {\n    // >>> fast-anything: Fuzzy.lev >>>\n    if (X.ON) return X.call(a);\n    // <<< fast-anything: Fuzzy.lev <<<\n    return a.length();\n}\n";
+        assert!(found(enabled, &kept[0]), "an enabled port isn't a change to the original");
+        assert_eq!(verbatim(enabled, &["static int lev(String a) {\n    return a.length();\n}"]), kept);
+        assert!(!found(&enabled.replace("a.length()", "a.length() + 1"), &kept[0]));
     }
 
     #[test]
