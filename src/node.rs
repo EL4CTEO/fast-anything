@@ -618,6 +618,7 @@ mod tests {
             lang: backend::Lang::Node,
             owner: None,
             line: 1,
+            sources: vec![],
         };
         for original in [
             "export const pairs = (names: string[]): number => {\n  return 0;\n};\n",
@@ -653,6 +654,7 @@ mod tests {
             lang: backend::Lang::Node,
             owner: None,
             line: 1,
+            sources: vec![],
         };
         let esm = shim(&port, "./.fast/lib/fa_fuzzy_levenshtein.node", true);
         assert!(esm.contains("createRequire(import.meta.url)(\"./.fast/lib/fa_fuzzy_levenshtein.node\").levenshtein"));

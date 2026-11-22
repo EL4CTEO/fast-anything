@@ -101,6 +101,14 @@ pub fn port(root: &Path, id: Option<&str>, samples: usize) -> Result<PortOut> {
         );
     }
     let enabled = ctx.state.ports.get(&hs.id).is_some_and(|p| p.enabled);
+    let helpers: Vec<Hotspot> = hs
+        .calls
+        .iter()
+        .filter_map(|name| ctx.state.hotspots.iter().find(|h| h.file == hs.file && &h.name == name))
+        .cloned()
+        .collect();
+    let text = fs::read_to_string(ctx.root.join(&hs.file)).unwrap_or_default();
+    let sources: Vec<&str> = std::iter::once(&hs).chain(&helpers).map(|h| h.source.as_str()).collect();
     let port = Port {
         id: hs.id.clone(),
         file: hs.file.clone(),
@@ -115,13 +123,8 @@ pub fn port(root: &Path, id: Option<&str>, samples: usize) -> Result<PortOut> {
         lang,
         owner: hs.owner.clone(),
         line: hs.line,
+        sources: crate::state::verbatim(&text, &sources),
     };
-    let helpers: Vec<Hotspot> = hs
-        .calls
-        .iter()
-        .filter_map(|name| ctx.state.hotspots.iter().find(|h| h.file == hs.file && &h.name == name))
-        .cloned()
-        .collect();
     let task = lang.scaffold(&ctx, &hs, &helpers, &port)?;
     ctx.state.ports.insert(port.id.clone(), port);
     ctx.save()?;
@@ -142,6 +145,9 @@ pub fn verify(root: &Path, id: Option<&str>) -> Result<(String, Verify)> {
     let id = ctx.resolve_port(id)?;
     let port = ctx.state.ports[&id].clone();
     let source_hash = backend::source_hash(&ctx.crate_dir(&port))?;
+    if ctx.stale(&port) {
+        ui::warn(format!("{} changed since {id} was recorded: {}", port.file, stale_hint(&id)));
+    }
     ui::step(format!("building {} (release)", ui::bold(&port.ext)));
     let v = match backend::build(&ctx, &port)? {
         Err(log) => Verify { built: false, build_log: Some(log), ..Verify::default() },
@@ -188,6 +194,13 @@ pub fn verify_all(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// What to do about a port whose original changed after it was recorded.
+pub fn stale_hint(id: &str) -> String {
+    format!(
+        "its recorded calls and Rust may be out of date. Run  fast-anything port {id}  to record again, update the Rust, then verify (or --force)"
+    )
+}
+
 /// What to do about a port that's right but slower than the original.
 pub fn slower_hint() -> &'static str {
     "calling into Rust costs more than this function's work, so it won't be switched on. Port its caller instead (fewer, bigger calls), or  enable --force"
@@ -197,6 +210,9 @@ pub fn enable(root: &Path, id: Option<&str>, force: bool) -> Result<String> {
     let mut ctx = Ctx::open(root)?;
     let id = ctx.resolve_port(id)?;
     let port = ctx.state.ports[&id].clone();
+    if ctx.stale(&port) && !force {
+        bail!("{} changed since {id} was recorded: {}", port.file, stale_hint(&id));
+    }
     let verified = port.verify.as_ref().is_some_and(Verify::ok);
     if !verified && !force {
         bail!("{id} hasn't passed verify yet: run  fast-anything verify {id}  (or --force)");
@@ -256,6 +272,9 @@ pub fn build_all(root: &Path) -> Result<()> {
 
 pub fn bench(root: &Path, runs: usize) -> Result<BenchResult> {
     let mut ctx = Ctx::open(root)?;
+    for p in ctx.state.ports.values().filter(|p| p.enabled && ctx.stale(p)) {
+        ui::warn(format!("{} changed since {} was recorded: {}", p.file, p.id, stale_hint(&p.id)));
+    }
     let result = bench::run(&ctx, runs.max(1))?;
     ctx.state.bench = Some(result.clone());
     ctx.save()?;

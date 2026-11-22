@@ -525,6 +525,7 @@ mod tests {
             lang: crate::backend::Lang::Python,
             owner: None,
             line: 1,
+            sources: vec![],
         }
     }
 
