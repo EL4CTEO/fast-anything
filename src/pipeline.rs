@@ -224,6 +224,15 @@ pub fn disable(root: &Path, id: Option<&str>) -> Result<String> {
     Ok(id)
 }
 
+/// Switch every enabled port back to the original code; returns their ids.
+pub fn disable_all(root: &Path) -> Result<Vec<String>> {
+    let ids: Vec<String> = Ctx::open(root)?.state.ports.values().filter(|p| p.enabled).map(|p| p.id.clone()).collect();
+    for id in &ids {
+        disable(root, Some(id))?;
+    }
+    Ok(ids)
+}
+
 pub fn build_all(root: &Path) -> Result<()> {
     let ctx = Ctx::open(root)?;
     ensure!(!ctx.state.ports.is_empty(), "nothing ported yet");
