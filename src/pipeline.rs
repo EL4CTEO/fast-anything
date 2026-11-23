@@ -243,11 +243,32 @@ pub fn enable(root: &Path, id: Option<&str>, force: bool) -> Result<String> {
     Ok(id)
 }
 
+fn markers_for_port(port: &Port) -> Vec<(String, String)> {
+    let (comment, ids): (&str, Vec<String>) = match port.lang {
+        Lang::Python | Lang::Ruby | Lang::R => ("#", vec![port.id.clone()]),
+        Lang::Php | Lang::C | Lang::Cpp => ("//", vec![port.id.clone(), format!("{} bridge", port.id)]),
+        _ => ("//", vec![port.id.clone()]),
+    };
+    ids.iter().map(|id| backend::markers(comment, id)).collect()
+}
+
 pub fn disable(root: &Path, id: Option<&str>) -> Result<String> {
     let mut ctx = Ctx::open(root)?;
     let id = ctx.resolve_port(id)?;
     let port = &ctx.state.ports[&id];
+    let file = ctx.root.join(&port.file);
+    let before = fs::read_to_string(&file).with_context(|| format!("reading {}", port.file))?;
+    for (begin, end) in markers_for_port(port) {
+        ensure!(
+            before.contains(&begin) == before.contains(&end),
+            "the fast-anything block for {id} is incomplete; restore its begin/end markers before disabling"
+        );
+    }
     port.lang.disable(&ctx, port)?;
+    let after = fs::read_to_string(&file).with_context(|| format!("reading {}", port.file))?;
+    for (begin, end) in markers_for_port(port) {
+        ensure!(!after.contains(&begin) && !after.contains(&end), "the fast-anything block for {id} wasn't removed");
+    }
     if let Some(p) = ctx.state.ports.get_mut(&id) {
         p.enabled = false;
     }
@@ -479,5 +500,58 @@ mod tests {
         );
         let wrong = Verify { failed: 1, ..v };
         assert!(feedback(&wrong).contains("failed"));
+    }
+
+    fn enabled_project(name: &str, text: &str) -> (PathBuf, String) {
+        let root = std::env::temp_dir().join(format!("fa-disable-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("app.py"), text).unwrap();
+        let port = Port {
+            id: "demo".into(),
+            file: "app.py".into(),
+            module: "app".into(),
+            func: "f".into(),
+            ext: "fa_demo".into(),
+            crate_dir: ".fast/ports/demo".into(),
+            recorded: 1,
+            calls_seen: 1,
+            verify: None,
+            enabled: true,
+            lang: Lang::Python,
+            owner: None,
+            line: 1,
+            sources: vec![],
+        };
+        let id = port.id.clone();
+        let mut ctx = Ctx::open(&root).unwrap();
+        ctx.state.ports.insert(port.id.clone(), port);
+        ctx.save().unwrap();
+        (root, id)
+    }
+
+    #[test]
+    fn disable_rejects_damaged_blocks_without_changing_state() {
+        let (begin, end) = backend::markers("#", "demo");
+        for (name, text) in [("missing-end", format!("{begin}\nf = rust\n")), ("missing-begin", format!("{end}\n"))] {
+            let (root, id) = enabled_project(name, &text);
+            let err = disable(&root, Some(&id)).unwrap_err();
+            assert!(err.to_string().contains("incomplete"), "{err}");
+            assert_eq!(fs::read_to_string(root.join("app.py")).unwrap(), text);
+            assert!(Ctx::open(&root).unwrap().state.ports[&id].enabled);
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn disable_removes_a_complete_block() {
+        let (begin, end) = backend::markers("#", "demo");
+        let original = "def f():\n    pass\n";
+        let text = format!("{original}\n{begin}\nf = rust\n{end}\n");
+        let (root, id) = enabled_project("complete", &text);
+        disable(&root, Some(&id)).unwrap();
+        assert_eq!(fs::read_to_string(root.join("app.py")).unwrap(), original);
+        assert!(!Ctx::open(&root).unwrap().state.ports[&id].enabled);
+        let _ = fs::remove_dir_all(root);
     }
 }
