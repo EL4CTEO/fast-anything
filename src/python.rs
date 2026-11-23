@@ -889,6 +889,127 @@ mod tests {
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     }
 
+    /// Calls reached through an import: `sp.run` after `import subprocess as sp`, `system` after
+    /// `from os import system`. Each case says what `describe` must block, and what it must leave alone
+    /// (shadowed names, imports in another function, pure calls, the checks that worked without imports).
+    const IMPORT_CASES: &str = r#"import ast, os, runpy, sys
+runner, d = sys.argv[1], sys.argv[2]
+describe = runpy.run_path(runner)["describe"]
+CASES = [
+    # (name, source, function, expected blockers)
+    ("alias", "import subprocess as sp\ndef f(x):\n    sp.run(['true'])\n    return x\n", "f", ["does I/O: subprocess.run"]),
+    ("from", "from os import system\ndef f(x):\n    system('true')\n    return x\n", "f", ["does I/O: os.system"]),
+    ("path", "from pathlib import Path\ndef f(x, p):\n    Path(p).write_text(str(x))\n    return x\n", "f", ["does I/O: pathlib.Path"]),
+    ("random", "from random import random\ndef f(x):\n    return x + random()\n", "f", ["not deterministic: random.random"]),
+    ("local import", "def f(x):\n    from time import sleep\n    sleep(0)\n    return x\n", "f", ["not deterministic: time.sleep"]),
+    ("gzip open (regression)", "from gzip import open\ndef f(p):\n    return open(p).read()\n", "f", ["does I/O: open"]),
+    ("rich print (regression)", "from rich import print\ndef f(x):\n    print(x)\n    return x\n", "f", ["does I/O: print"]),
+    ("builtins alias", "import builtins as b\ndef f(p):\n    return b.open(p)\n", "f", ["does I/O: open"]),
+    ("numpy random (regression)", "from numpy import random\ndef f():\n    return random.random()\n", "f", ["not deterministic: random.random"]),
+    ("local leak FP", "def other():\n    import random as r\n    return r.random()\n\ndef pure(r):\n    return r.get('k')\n", "pure", []),
+    ("local overwrite FN", "import random as r\ndef impure():\n    return r.random()\ndef other():\n    import math as r\n    return r.sqrt(4)\n", "impure", ["not deterministic: random.random"]),
+    ("local overwrite FP", "import math as m\ndef pure(x):\n    return m.sqrt(x)\ndef other():\n    import random as m\n    return m.random()\n", "pure", []),
+    ("main leak FP", "def parse(p):\n    return p.split('/')\n\nif __name__ == '__main__':\n    import pathlib as p\n    p.Path('x').write_text('hi')\n", "parse", []),
+    ("param shadow", "from os import path\ndef f(path):\n    return path.strip()\n", "f", []),
+    ("local assign shadow", "from os import system\ndef f(x):\n    system = lambda v: v + 1\n    return system(x)\n", "f", []),
+    ("nested def shadow", "from os import system\ndef f(x):\n    def system(y):\n        return y + 1\n    return system(x)\n", "f", []),
+    ("class shadow", "from pathlib import Path\nclass Path:\n    pass\ndef f(x):\n    return Path(x)\n", "f", []),
+    ("local import beats top", "def run(x):\n    return x + 1\ndef danger(cmd):\n    from subprocess import run\n    run(cmd)\n    return 0\n", "danger", ["does I/O: subprocess.run"]),
+    ("top beats module import", "from subprocess import run\ndef run(x):\n    return x + 1\ndef f(x):\n    return run(x)\n", "f", []),
+    ("try/except both", "try:\n    import subprocess as sp\nexcept ImportError:\n    import my_stub as sp\ndef f(x):\n    sp.run(['true'])\n    return x\n", "f", ["does I/O: subprocess.run"]),
+    ("relative shadows", "import random as helper\ndef f():\n    from . import helper\n    return helper.compute()\n", "f", []),
+    ("urlparse pure", "from urllib.parse import urlparse\ndef f(u):\n    return urlparse(u).netloc\n", "f", []),
+    ("timedelta pure", "from datetime import date, timedelta\ndef f(y):\n    return date(y, 1, 1) + timedelta(days=1)\n", "f", []),
+    ("datetime.now nondet", "from datetime import datetime\ndef f():\n    return datetime.now()\n", "f", ["not deterministic: datetime.now"]),
+    ("os.path.join pure", "from os.path import join\ndef f(a, b):\n    return join(a, b)\n", "f", []),
+    ("os.path.exists io", "from os.path import exists\ndef f(p):\n    return exists(p)\n", "f", ["does I/O: os.path.exists"]),
+    ("StringIO pure", "from io import StringIO\ndef f(s):\n    return StringIO(s).read()\n", "f", []),
+    ("math pure", "from math import sqrt\ndef f(x):\n    return sqrt(x)\n", "f", []),
+    ("future", "from __future__ import annotations\ndef f(x: int) -> int:\n    return x\n", "f", []),
+    ("dotted alias", "import os.path as osp\ndef f(p):\n    return osp.getsize(p)\n", "f", ["does I/O: os.path.getsize"]),
+    ("plain dotted import", "import os.path\ndef f(p):\n    return os.path.getsize(p)\n", "f", ["does I/O: os.path.getsize"]),
+    ("pl alias is pathlib", "import pathlib as pl\ndef f(p, x):\n    pl.Path(p).write_text(str(x))\n    return x\n", "f", ["does I/O: pathlib.Path"]),
+    ("numpy random alias", "from numpy import random as rng\ndef f():\n    return rng.random()\n", "f", ["not deterministic: numpy.random.random"]),
+    ("comprehension target", "import pathlib as p\ndef f(items):\n    xs = [p.strip() for p in items]\n    p.Path('o').write_text('x')\n    return xs\n", "f", ["does I/O: pathlib.Path"]),
+    ("nested def binding", "from os import system\ndef f(x):\n    def inner():\n        system = 1\n    return system(x)\n", "f", ["does I/O: os.system"]),
+    ("nested def import", "import random as r\ndef f():\n    def inner():\n        import math as r\n    return r.random()\n", "f", ["not deterministic: random.random"]),
+    ("nested import stays inside", "import math as m\ndef f(x):\n    def inner():\n        import subprocess as m\n    return m.sqrt(x)\n", "f", []),
+    ("lambda param", "from os import path\ndef f(items):\n    return sorted(items, key=lambda path: path.lower())\n", "f", []),
+    ("nested def param", "from os import path\ndef f(items):\n    def norm(path):\n        return path.strip()\n    return [norm(i) for i in items]\n", "f", []),
+    ("main guard import counts", "def f(x):\n    return p.Path(x).read_text()\nif __name__ == '__main__':\n    import pathlib as p\n    f('x')\n", "f", ["does I/O: pathlib.Path"]),
+    ("polyfill def", "try:\n    from subprocess import run\nexcept ImportError:\n    def run(cmd):\n        return None\ndef f(cmd):\n    run(cmd)\n    return 0\n", "f", ["does I/O: subprocess.run"]),
+    ("import after def", "def run(x):\n    return x + 1\nfrom subprocess import run\ndef f(x):\n    return run(x)\n", "f", ["does I/O: subprocess.run"]),
+    ("module reassign", "from os import path\npath = {'a': 1}\ndef f(k):\n    return path.get(k)\n", "f", []),
+    ("module relative after", "import random as helper\nfrom . import helper\ndef f():\n    return helper.compute()\n", "f", []),
+    ("match capture", "from os import path\ndef f(x):\n    match x:\n        case str() as path:\n            return path.strip()\n    return x\n", "f", []),
+    ("builtins param", "def f(builtins, x):\n    return builtins.open(x)\n", "f", []),
+    ("plain builtins import", "import builtins\ndef f(x):\n    return builtins.open(x)\n", "f", ["does I/O: open"]),
+    ("fromisoformat pure", "from datetime import date\ndef f(s):\n    return date.fromisoformat(s)\n", "f", []),
+    ("datetime alias now", "from datetime import datetime as dt\ndef f():\n    return dt.now()\n", "f", ["not deterministic: datetime.datetime.now"]),
+    ("uuid5 pure", "from uuid import uuid5, NAMESPACE_DNS\ndef f(s):\n    return uuid5(NAMESPACE_DNS, s)\n", "f", []),
+    ("class method scope", "import subprocess as sp\nclass C:\n    sp = 1\n    @staticmethod\n    def f(x):\n        sp.run(['true'])\n        return x\n", "f", ["does I/O: subprocess.run"]),
+    ("np.random", "import numpy as np\ndef f(n):\n    return np.random.rand(n)\n", "f", ["not deterministic: numpy.random.rand"]),
+    ("local import then reassign", "def f(k):\n    from os import path\n    path = {'a': 1}\n    return path.get(k)\n", "f", []),
+    ("two local imports", "def f(x):\n    import subprocess as m\n    import math as m\n    return m.sqrt(x)\n", "f", []),
+    ("local import then relative", "def f():\n    import random as helper\n    from . import helper\n    return helper.compute()\n", "f", []),
+    ("param then later import", "def f(p):\n    s = p.strip()\n    import pathlib as p\n    return p.PurePath(s)\n", "f", []),
+    ("comprehension first iterable", "from pathlib import Path\ndef f():\n    return [Path.name for Path in Path('.').iterdir()]\n", "f", ["does I/O: pathlib.Path"]),
+    ("nested default", "import random as r\ndef f():\n    def inner(r=r.random()):\n        return r\n    return inner()\n", "f", ["not deterministic: random.random"]),
+    ("nested decorator", "import random as r\nfrom functools import lru_cache\ndef f():\n    @lru_cache(maxsize=r.randint(1, 9))\n    def g(r):\n        return r\n    return g(1)\n", "f", ["not deterministic: random.randint"]),
+    ("own default", "from os import getcwd\ndef f(getcwd=getcwd()):\n    return getcwd\n", "f", ["does I/O: os.getcwd"]),
+    ("class body is no scope for methods", "import subprocess as sp\ndef f(x):\n    class C:\n        sp = 1\n        def m(self):\n            sp.run(['true'])\n    C().m()\n    return x\n", "f", ["does I/O: subprocess.run"]),
+    ("class import stays in class", "import math as m\ndef f(x):\n    class C:\n        import subprocess as m\n        def g(self):\n            return m.sqrt(x)\n    return C().g()\n", "f", []),
+    ("bare annotation", "from pathlib import Path\nPath: object\ndef f(p):\n    Path(p).write_text('hi')\n", "f", ["does I/O: pathlib.Path"]),
+    ("module for target", "import subprocess as sp\nfor sp in []:\n    pass\ndef f():\n    sp.run(['true'])\n", "f", ["does I/O: subprocess.run"]),
+    ("rebound module name", "import time\nFLAG = True\nif FLAG:\n    time = lambda x: x + 1\ndef f(x):\n    return time(x)\n", "f", []),
+    ("if-branch local binding", "from os import path\ndef f(x):\n    if x:\n        path = x\n    return path.strip()\n", "f", []),
+    ("rebind from own value", "def f():\n    import subprocess as sp\n    sp = sp.run(['true'])\n    return sp\n", "f", ["does I/O: subprocess.run"]),
+    ("with target from own call", "def f():\n    from pathlib import Path\n    with Path('x').open() as Path:\n        pass\n", "f", ["does I/O: pathlib.Path"]),
+    ("class in class", "import subprocess as sp\ndef f():\n    class C:\n        sp = 1\n        class D:\n            y = sp.run(['true'])\n    return C\n", "f", ["does I/O: subprocess.run"]),
+]
+fails = 0
+for i, (label, src, func, want) in enumerate(CASES):
+    f = os.path.join(d, f"case{i}.py")
+    open(f, "w").write(src)
+    line = next(n.lineno for n in ast.walk(ast.parse(src)) if isinstance(n, ast.FunctionDef) and n.name == func)
+    info = describe(f, line, func, None, d)
+    got = info["blockers"] if info else None
+    ok = got == want and info["module"] == f"case{i}"
+    fails += not ok
+    if not ok:
+        print("FAIL", label, f"got={got} want={want}", file=sys.stderr)
+# array-library warning kept, named once
+src = "import numpy as np\ndef f(x):\n    return np.sum(x)\n"
+f = os.path.join(d, "arr.py"); open(f, "w").write(src)
+w = describe(f, 2, "f", None, d)["warnings"]
+ok = any(x.startswith("already uses np,") for x in w); fails += not ok
+if not ok:
+    print("FAIL numpy warning", w, file=sys.stderr)
+sys.exit(1 if fails else 0)
+"#;
+
+    #[test]
+    fn io_through_an_import_is_seen() {
+        let Some(python) = ["python3", "python"]
+            .into_iter()
+            .find(|p| Command::new(p).arg("--version").output().is_ok_and(|o| o.status.success()))
+        else {
+            eprintln!("no python on PATH, skipping");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("fa-import-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("runner.py"), RUNNER).unwrap();
+        let out = Command::new(python)
+            .args(["-I", "-c", IMPORT_CASES])
+            .arg(dir.join("runner.py"))
+            .arg(&dir)
+            .output()
+            .unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+
     #[test]
     fn maps_annotations() {
         assert_eq!(rust_type("str", false).as_deref(), Some("&str"));

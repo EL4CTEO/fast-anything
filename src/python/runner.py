@@ -27,6 +27,21 @@ IO_MODULES = {"os", "sys", "subprocess", "socket", "requests", "urllib", "http",
               "pathlib", "logging", "sqlite3", "tempfile", "glob", "asyncio", "threading", "multiprocessing", "io"}
 NONDET_MODULES = {"random", "time", "datetime", "uuid", "secrets"}
 ARRAY_LIBS = {"np", "numpy", "pd", "pandas", "torch", "scipy", "numba", "polars", "pl"}
+# Pure callables from the modules above: imported by name, they don't block a function.
+PURE_CALLS = {
+    "datetime.date", "datetime.datetime", "datetime.time", "datetime.timedelta", "datetime.timezone",
+    "datetime.date.fromisoformat", "datetime.date.fromordinal", "datetime.date.fromisocalendar",
+    "datetime.datetime.fromisoformat", "datetime.datetime.strptime", "datetime.datetime.combine",
+    "datetime.time.fromisoformat", "io.StringIO", "io.BytesIO",
+    "pathlib.PurePath", "pathlib.PurePosixPath", "pathlib.PureWindowsPath",
+    "os.fspath", "os.fsdecode", "os.fsencode", "os.path.join", "os.path.basename", "os.path.dirname",
+    "os.path.split", "os.path.splitext", "os.path.normpath", "os.path.normcase", "os.path.isabs",
+    "os.path.commonpath", "os.path.commonprefix", "uuid.UUID", "uuid.uuid3", "uuid.uuid5",
+    "http.HTTPStatus", "http.HTTPMethod", "secrets.compare_digest", "glob.escape", "glob.has_magic",
+    "socket.inet_aton", "socket.inet_ntoa", "socket.inet_pton", "socket.inet_ntop",
+    "socket.htons", "socket.ntohs", "socket.htonl", "socket.ntohl",
+}
+PURE_MODULES = {"urllib.parse"}
 
 
 # ------------------------------------------------------------------ values
@@ -262,8 +277,205 @@ def parse_file(path):
         guard = next((n.lineno for n in tree.body if isinstance(n, ast.If) and is_main_guard(n.test)), None)
         records = {n.name: record_class_fields(n) for n in tree.body
                    if isinstance(n, ast.ClassDef) and is_record_class(n)}
-        _files[path] = (src, by_line, top, guard, records)
+        _files[path] = (src, by_line, top, guard, records, module_names(tree))
     return _files[path]
+
+
+# --- names that stand for an imported module or function, by scope
+
+# Nodes with a scope of their own: names bound inside them don't reach the code around them.
+SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef,
+          ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+BLOCKS = ("body", "orelse", "finalbody", "handlers", "cases")
+
+
+def imports_in(node):
+    """name -> dotted names, for an import statement. `import subprocess as sp` gives sp: subprocess,
+    `from os import system` gives system: os.system; a relative import gives () (the app's own)."""
+    out = {}
+    if isinstance(node, ast.Import):
+        for a in node.names:
+            name = a.asname or a.name.split(".")[0]
+            out.setdefault(name, set()).add(tuple(a.name.split(".")) if a.asname else (name,))
+    elif isinstance(node, ast.ImportFrom) and node.module != "__future__":
+        for a in node.names:
+            if a.name != "*":
+                target = tuple(node.module.split(".")) + (a.name,) if node.module and node.level == 0 else ()
+                out.setdefault(a.asname or a.name, set()).add(target)
+    return out
+
+
+def binds(node):
+    """Names `node` binds in the scope it sits in, other than by importing."""
+    if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+        return [node.id]
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return [node.name]
+    if isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)) and node.name:
+        return [node.name]
+    if isinstance(node, ast.MatchMapping) and node.rest:
+        return [node.rest]
+    return []
+
+
+def evaluated_outside(scope):
+    """The parts of a scope node that run in the scope around it: decorators, defaults, class bases,
+    a comprehension's first iterable."""
+    if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        args = scope.args
+        parts = list(args.defaults) + [d for d in args.kw_defaults if d is not None]
+        return parts + list(getattr(scope, "decorator_list", []))
+    if isinstance(scope, ast.ClassDef):
+        return list(scope.decorator_list) + list(scope.bases) + [k.value for k in scope.keywords]
+    return [scope.generators[0].iter]
+
+
+def header_binds(st):
+    """What a statement binds outside its blocks (assignment, for and with targets...), not entering scopes."""
+    if isinstance(st, SCOPES):
+        return binds(st)
+    if isinstance(st, ast.AnnAssign) and st.value is None:
+        return []  # `x: int` declares, it doesn't bind
+    names, stack = binds(st), [v for f, v in ast.iter_fields(st) if f not in BLOCKS]
+    while stack:
+        v = stack.pop()
+        if isinstance(v, list):
+            stack.extend(v)
+        elif isinstance(v, ast.AST) and not isinstance(v, SCOPES):
+            names += binds(v)
+            stack.extend(ast.iter_child_nodes(v))
+    return names
+
+
+def bound_at(st):
+    """Where a statement's bindings take effect: once its header ran (an assignment's value, a with's
+    context, a for's iterable, a def's defaults), so `sp = sp.run()` still calls the imported `sp`."""
+    ends = [(n.end_lineno, n.end_col_offset) for f, v in ast.iter_fields(st) if f not in BLOCKS
+            for top in (v if isinstance(v, list) else [v]) if isinstance(top, ast.AST)
+            for n in ast.walk(top) if getattr(n, "end_lineno", None)]  # a withitem has no position of its own
+    return max(ends) if ends else (getattr(st, "lineno", 0), getattr(st, "col_offset", 0))
+
+
+def bindings(stmts, maybe=False, out=None):
+    """(position, name, dotted names, maybe) for each binding in `stmts`, in order. An import binds what it
+    imports, anything else binds nothing known. A binding inside an if/try/with/for/while/match block, or a
+    for target, may or may not have happened."""
+    out = [] if out is None else out
+    for st in stmts:
+        pos = bound_at(st)
+        for name, targets in imports_in(st).items():
+            out.append((pos, name, frozenset(targets), maybe))
+        if not isinstance(st, (ast.Import, ast.ImportFrom)):
+            loop = isinstance(st, (ast.For, ast.AsyncFor))
+            out += [(pos, name, frozenset(), maybe or loop) for name in header_binds(st)]
+        if not isinstance(st, SCOPES):
+            for f in BLOCKS:
+                bindings(getattr(st, f, None) or [], True, out)
+    return out
+
+
+def state(entries, names=None, before=None):
+    """What each name stands for after `entries` (up to position `before`): a later plain binding replaces
+    an earlier one, a maybe-binding adds to it."""
+    names = dict(names or {})
+    for pos, name, targets, maybe in entries:
+        if before is None or pos < before:
+            names[name] = names.get(name, frozenset()) | targets if maybe else targets
+    return names
+
+
+def module_names(tree):
+    """What each name stands for at module level, after the whole module ran (imported names only)."""
+    return {name: targets for name, targets in state(bindings(tree.body)).items() if targets}
+
+
+def scope_bindings(scope):
+    """The bindings of a scope node's own body, its parameters first."""
+    if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        a = scope.args
+        params = [((0, 0), x.arg, frozenset(), False)
+                  for x in a.posonlyargs + a.args + a.kwonlyargs + [v for v in (a.vararg, a.kwarg) if v]]
+        body = scope.body if isinstance(scope.body, list) else []
+        return params + bindings(body)
+    if isinstance(scope, ast.ClassDef):
+        return bindings(scope.body)
+    # a comprehension binds its targets
+    return [((0, 0), name, frozenset(), False) for g in scope.generators for n in ast.walk(g.target) for name in binds(n)]
+
+
+def resolved_calls(function, module_level):
+    """Calls in `function` (nested scopes included) whose first name stands for an imported module or
+    function at that call, with what it stands for. Follows Python's scoping: a scope's own bindings hide
+    the outer ones (the last one before the call counts), a class body is no scope for the functions in
+    it, and decorators, defaults and a comprehension's first iterable run in the scope around."""
+    found = []
+    flat = {}
+
+    def lookup(env, name, at):
+        local, outer = env
+        if name in local:
+            entries, imported = local[name]
+            if not imported:
+                return frozenset()  # a plain local
+            return state(entries, before=at).get(name, frozenset())
+        return outer.get(name, frozenset())
+
+    def visit(node, env, fn_env, skip):
+        for child in ast.iter_child_nodes(node):
+            if id(child) in skip:
+                continue
+            if isinstance(child, SCOPES):
+                enter(child, env, fn_env)
+                continue
+            if isinstance(child, ast.Call):
+                target = dotted(child.func)
+                if target:
+                    origins = lookup(env, target[0], (child.lineno, child.col_offset))
+                    if origins:
+                        found.append((target, origins))
+            visit(child, env, fn_env, skip)
+
+    def flatten(env):
+        """An env as plain names, for a nested scope to start from (its own bindings come on top)."""
+        if id(env) not in flat:
+            local, outer = env
+            names = dict(outer)
+            for name, (entries, _) in local.items():
+                names[name] = state(entries).get(name, frozenset())
+            flat[id(env)] = (env, names)  # keep env alive so its id isn't reused
+        return flat[id(env)][1]
+
+    def enter(scope, env, fn_env):
+        heads = evaluated_outside(scope)
+        for h in heads:
+            visit(ast.Expr(value=h), env, fn_env, frozenset())
+        entries = {}
+        for entry in scope_bindings(scope):
+            entries.setdefault(entry[1], []).append(entry)
+        own = {name: (es, any(e[2] for e in es)) for name, es in entries.items()}
+        is_class = isinstance(scope, ast.ClassDef)
+        inner = (own, flatten(fn_env))  # a class body sees the enclosing function, never an outer class body
+        visit(scope, inner, fn_env if is_class else inner, frozenset(map(id, heads)))
+
+    enter(function, ({}, module_level), ({}, module_level))
+    return found
+
+
+def resolved_effect(full):
+    """("io" | "nondet", name) for a call resolved through an import, or None."""
+    name = ".".join(full)
+    if name in PURE_CALLS or any(name.startswith(m + ".") for m in PURE_MODULES):
+        return None
+    if len(full) < 2:
+        return None  # a module isn't callable: the name was rebound to something else
+    head = full[0]
+    if head == "builtins" and len(full) == 2 and full[1] in IO_NAMES:
+        return "io", full[1]
+    if head in IO_MODULES:
+        return "io", name
+    if head in NONDET_MODULES or (head in ARRAY_LIBS and len(full) > 2 and full[1] == "random"):
+        return "nondet", name
+    return None
 
 
 def is_record_class(node):
@@ -325,7 +537,7 @@ def describe(path, line, name, entry, base):
     parsed = parse_file(path)
     if parsed is None:
         return None
-    src, by_line, top, guard, records = parsed
+    src, by_line, top, guard, records, module_level_names = parsed
     hit = by_line.get(line)
     if hit is None or hit[0].name != name:
         return None
@@ -377,6 +589,15 @@ def describe(path, line, name, entry, base):
                 nondet.add(".".join(target))
             elif head in ARRAY_LIBS:
                 arrays.add(head)
+    # the same calls through an import: `sp.run` is subprocess.run, `system` is os.system
+    for target, origins in resolved_calls(node, module_level_names):
+        head = target[0]
+        if (head in IO_NAMES if len(target) == 1 else head in IO_MODULES or head in NONDET_MODULES):
+            continue  # already caught by name
+        for origin in origins:
+            effect = origin and resolved_effect(list(origin) + target[1:])
+            if effect:
+                (io if effect[0] == "io" else nondet).add(effect[1])
     if is_generator:
         blockers.append("generator (yield)")
     if writes_globals:
