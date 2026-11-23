@@ -119,7 +119,7 @@ pub fn port(root: &Path, id: Option<&str>, samples: usize) -> Result<PortOut> {
     let helpers: Vec<Hotspot> = hs
         .calls
         .iter()
-        .filter_map(|name| ctx.state.hotspots.iter().find(|h| h.file == hs.file && &h.name == name))
+        .filter_map(|name| hotspot::helpers_named(&ctx.state.hotspots, &hs, name).first().copied())
         .cloned()
         .collect();
     let text = fs::read_to_string(ctx.root.join(&hs.file)).unwrap_or_default();
