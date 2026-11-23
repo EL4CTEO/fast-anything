@@ -22,6 +22,10 @@ import time
 DISABLE_ENV = "FAST_ANYTHING_DISABLE"
 SKIP_DIRS = {".fast", ".git", "venv", ".venv", "env", ".env", "site-packages", "dist-packages",
              "node_modules", "__pycache__", "build", "dist", ".tox", ".nox"}
+# Process state used without a call: `os.environ["X"]` is as much a hidden input as `os.getenv("X")`,
+# and `json.load(sys.stdin)` as much I/O as `sys.stdin.read()`. Calls on these are judged by IO_MODULES.
+STATE_READS = {"os.environ", "os.environb", "sys.argv", "sys.orig_argv",
+               "sys.stdin", "sys.stdout", "sys.stderr", "sys.__stdin__", "sys.__stdout__", "sys.__stderr__"}
 IO_NAMES = {"print", "open", "input", "exec", "eval", "compile", "__import__", "breakpoint", "exit", "quit"}
 IO_MODULES = {"os", "sys", "subprocess", "socket", "requests", "urllib", "http", "httpx", "aiohttp", "shutil",
               "pathlib", "logging", "sqlite3", "tempfile", "glob", "asyncio", "threading", "multiprocessing", "io"}
@@ -355,6 +359,18 @@ def describe(path, line, name, entry, base):
         factor *= 0.7
 
     io, nondet, arrays, helpers = set(), set(), set(), set()
+    called = set()  # the a.b of a call a.b.c(...), which the call check already judged
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Call):
+            n = sub.func
+            while isinstance(n, ast.Attribute):
+                called.add(id(n))
+                n = n.value
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Attribute) and id(sub) not in called:
+            read = ".".join(dotted(sub) or [])
+            if read in STATE_READS:
+                io.add(read)
     is_generator = writes_globals = False
     for sub in ast.walk(node):
         if isinstance(sub, (ast.Yield, ast.YieldFrom)):

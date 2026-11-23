@@ -860,6 +860,50 @@ mod tests {
     }
 
     #[test]
+    fn reading_the_environment_or_argv_blocks() {
+        let Some(python) = ["python3", "python"]
+            .into_iter()
+            .find(|p| Command::new(p).arg("--version").output().is_ok_and(|o| o.status.success()))
+        else {
+            eprintln!("no python on PATH, skipping");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("fa-environ-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("runner.py"), RUNNER).unwrap();
+        fs::write(
+            dir.join("work.py"),
+            "import json\nimport os\nimport sys\n\n\
+             def subscript(x):\n    return x * int(os.environ['SCALE'])\n\n\
+             def chained(x):\n    return os.environ['PATHS'].split(':') + [x]\n\n\
+             def member(x):\n    return x if 'CI' in os.environ else -x\n\n\
+             def argv(x):\n    return len(sys.argv[1]) + x\n\n\
+             def getenv(x):\n    return x * int(os.environ.get('SCALE', 1))\n\n\
+             def constants(x):\n    return x + len(os.sep) + sys.maxsize\n\n\
+             def keys(x):\n    return [k for k in os.environb] + [x]\n\n\
+             def orig(x):\n    return sys.orig_argv[0] + x\n\n\
+             def load():\n    return json.load(sys.stdin)\n\n\
+             def write(x):\n    sys.stdout.write(x)\n",
+        )
+        .unwrap();
+        let check = "import runpy, sys, os\n\
+                     d = sys.argv[1]\n\
+                     describe = runpy.run_path(os.path.join(d, 'runner.py'))['describe']\n\
+                     f = os.path.join(d, 'work.py')\n\
+                     want = {5: ('subscript', ['does I/O: os.environ']), 8: ('chained', ['does I/O: os.environ']),\n\
+                             11: ('member', ['does I/O: os.environ']), 14: ('argv', ['does I/O: sys.argv']),\n\
+                             17: ('getenv', ['does I/O: os.environ.get']), 20: ('constants', []),\n\
+                             23: ('keys', ['does I/O: os.environb']), 26: ('orig', ['does I/O: sys.orig_argv']),\n\
+                             29: ('load', ['does I/O: sys.stdin']), 32: ('write', ['does I/O: sys.stdout.write'])}\n\
+                     for line, (name, blockers) in want.items():\n\
+                     \x20   got = describe(f, line, name, None, d)['blockers']\n\
+                     \x20   assert got == blockers, (name, got)\n";
+        let out = Command::new(python).args(["-I", "-c", check]).arg(&dir).output().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[test]
     fn static_methods_are_portable() {
         let Some(python) = ["python3", "python"]
             .into_iter()
