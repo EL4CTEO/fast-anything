@@ -4,6 +4,7 @@
 package /*PKG*/
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"math"
@@ -30,7 +31,7 @@ func faFast_/*S*/(/*PARAMS*/) (/*RET*/, error, bool) {
 	}
 	in, err := faJSON_/*S*/([]any{/*ARGS*/})
 	if err != nil {
-		return zero, nil, false // NaN, Inf or non-UTF-8 input: let Go handle it
+		return zero, nil, false // non-UTF-8 or otherwise unencodable input: let Go handle it
 	}
 	var reply struct {
 		Ok    json.RawMessage `json:"ok"`
@@ -46,7 +47,15 @@ func faFast_/*S*/(/*PARAMS*/) (/*RET*/, error, bool) {
 		panic("fast-anything: " + *reply.Error)
 	}
 	var out /*RET*/
-	if err := json.Unmarshal(reply.Ok, &out); err != nil {
+	if bytes.Contains(reply.Ok, []byte(`"$float"`)) {
+		var raw any
+		if err := json.Unmarshal(reply.Ok, &raw); err != nil {
+			panic("fast-anything: " + err.Error())
+		}
+		if err := faDec_/*S*/(reflect.ValueOf(&out).Elem(), raw); err != nil {
+			panic("fast-anything: " + err.Error())
+		}
+	} else if err := json.Unmarshal(reply.Ok, &out); err != nil {
 		panic("fast-anything: " + err.Error())
 	}
 	return out, nil, true
@@ -78,8 +87,19 @@ func faEnc_/*S*/(b *strings.Builder, v reflect.Value) error {
 		b.WriteString(strconv.FormatUint(v.Uint(), 10))
 	case reflect.Float32, reflect.Float64:
 		f := v.Float()
-		if math.IsNaN(f) || math.IsInf(f, 0) {
-			return errors.New("NaN or Inf")
+		// NaN and infinity, which JSON has no numbers for, travel as {"$float": name}.
+		// The port's reply comes back the same way; faDec reads it.
+		if math.IsNaN(f) {
+			b.WriteString(`{"$float":"NaN"}`)
+			return nil
+		}
+		if math.IsInf(f, 1) {
+			b.WriteString(`{"$float":"Infinity"}`)
+			return nil
+		}
+		if math.IsInf(f, -1) {
+			b.WriteString(`{"$float":"-Infinity"}`)
+			return nil
 		}
 		bits := 64
 		if v.Kind() == reflect.Float32 {
@@ -121,6 +141,130 @@ func faEnc_/*S*/(b *strings.Builder, v reflect.Value) error {
 		b.WriteByte('}')
 	default:
 		return errors.New(v.Type().String())
+	}
+	return nil
+}
+
+// {"$float": name} back into a float; inside slices and maps too.
+func faUnwire_/*S*/(v any) any {
+	switch x := v.(type) {
+	case []any:
+		for i, e := range x {
+			x[i] = faUnwire_/*S*/(e)
+		}
+		return x
+	case map[string]any:
+		if len(x) == 1 {
+			switch x["$float"] {
+			case "NaN":
+				return math.NaN()
+			case "Infinity":
+				return math.Inf(1)
+			case "-Infinity":
+				return math.Inf(-1)
+			}
+		}
+		for k, e := range x {
+			x[k] = faUnwire_/*S*/(e)
+		}
+		return x
+	}
+	return v
+}
+
+// The port's JSON value into the Go value it decodes to: a {"$float": name} object is a float
+// again, everything else decodes the way encoding/json would. Runs only on replies that tag a float.
+func faDec_/*S*/(dst reflect.Value, src any) error {
+	if !dst.CanSet() {
+		return errors.New("unsettable " + dst.Type().String())
+	}
+	if src == nil {
+		return nil // null keeps the zero value, and nil slices, maps and pointers stay nil
+	}
+	switch dst.Kind() {
+	case reflect.Bool:
+		x, ok := src.(bool)
+		if !ok {
+			return errors.New("reply not a bool")
+		}
+		dst.SetBool(x)
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		x, ok := src.(float64)
+		if !ok {
+			return errors.New("reply not a number")
+		}
+		dst.SetInt(int64(x))
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		x, ok := src.(float64)
+		if !ok {
+			return errors.New("reply not a number")
+		}
+		dst.SetUint(uint64(x))
+	case reflect.Float32, reflect.Float64:
+		x, ok := faUnwire_/*S*/(src).(float64)
+		if !ok {
+			return errors.New("reply not a number")
+		}
+		dst.SetFloat(x)
+	case reflect.String:
+		x, ok := src.(string)
+		if !ok {
+			return errors.New("reply not a string")
+		}
+		dst.SetString(x)
+	case reflect.Slice:
+		xs, ok := src.([]any)
+		if !ok {
+			return errors.New("reply not an array")
+		}
+		s := reflect.MakeSlice(dst.Type(), len(xs), len(xs))
+		for i, x := range xs {
+			if err := faDec_/*S*/(s.Index(i), x); err != nil {
+				return err
+			}
+		}
+		dst.Set(s)
+	case reflect.Array:
+		xs, ok := src.([]any)
+		if !ok || len(xs) != dst.Len() {
+			return errors.New("reply not an array of " + strconv.Itoa(dst.Len()))
+		}
+		for i, x := range xs {
+			if err := faDec_/*S*/(dst.Index(i), x); err != nil {
+				return err
+			}
+		}
+	case reflect.Map:
+		if dst.Type().Key().Kind() != reflect.String {
+			return errors.New("map without string keys")
+		}
+		xs, ok := src.(map[string]any)
+		if !ok {
+			return errors.New("reply not an object")
+		}
+		m := reflect.MakeMapWithSize(dst.Type(), len(xs))
+		for k, x := range xs {
+			e := reflect.New(dst.Type().Elem()).Elem()
+			if err := faDec_/*S*/(e, x); err != nil {
+				return err
+			}
+			m.SetMapIndex(reflect.ValueOf(k), e)
+		}
+		dst.Set(m)
+	case reflect.Pointer:
+		p := reflect.New(dst.Type().Elem())
+		if err := faDec_/*S*/(p.Elem(), src); err != nil {
+			return err
+		}
+		dst.Set(p)
+	case reflect.Interface:
+		v := reflect.ValueOf(faUnwire_/*S*/(src))
+		if !v.IsValid() || !v.Type().AssignableTo(dst.Type()) {
+			return errors.New("reply not a " + dst.Type().String())
+		}
+		dst.Set(v)
+	default:
+		return errors.New(dst.Type().String())
 	}
 	return nil
 }

@@ -490,8 +490,9 @@ pub const FLAVOR: Flavor = Flavor {
         "A nil slice or map arrives (and may be returned) as an empty Vec or HashMap: fast-anything treats them as equal.",
         "Map iteration order is random in Go: return results in the order the original does when it's deterministic.",
         "A function returning (T, error): return `Err(message)` where it returns a non-nil error (its message is `err.Error()`); enabled, Go gets `errors.New(message)` back, so callers comparing against sentinel errors (`err == io.EOF`, `errors.Is`) won't match.",
+        "NaN and infinity reach the port (and may be returned) as ordinary `f64`/`f32`: the JSON wire tags them.",
     ],
-    floats: None,
+    floats: Some(native::FLOATS),
 };
 
 pub fn scaffold(ctx: &Ctx, hs: &Hotspot, helpers: &[Hotspot], port: &Port) -> Result<String> {
@@ -575,6 +576,83 @@ pub fn disable(ctx: &Ctx, port: &Port) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nan_and_infinity_cross_the_bridge_tagged() {
+        if !Command::new("go").arg("version").output().is_ok_and(|o| o.status.success()) {
+            eprintln!("no go on PATH, skipping");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("fa-go-floats-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let fill = |s: &str, params: &str, args: &str, ret: &str| {
+            BRIDGE
+                .replace("/*S*/", s)
+                .replace("/*PKG*/", "main")
+                .replace("/*ID*/", "m.f")
+                .replace("/*PARAMS*/", params)
+                .replace("/*ARGS*/", args)
+                .replace("/*RET*/", ret)
+                .replace("/*ERRORS*/", "false")
+                .replace("/*LIB*/", "\"lib\"")
+        };
+        // a stand-in for the port: echoes tagged NaN and infinity back for tagged input
+        let main = r#"package main
+
+import (
+	"fmt"
+	"math"
+	"os"
+)
+
+var seen []string
+
+func faLoad_t(path string) bool { return true }
+func faLoad_u(path string) bool { return true }
+
+func faInvoke_t(in []byte) []byte {
+	seen = append(seen, string(in))
+	arg := string(in)[1:]
+	arg = arg[:len(arg)-1]
+	if arg[0] == '{' {
+		return []byte(`{"ok":` + arg + `}`)
+	}
+	return []byte(`{"ok":4.5}`)
+}
+
+func faInvoke_u(in []byte) []byte {
+	seen = append(seen, string(in))
+	return []byte(`{"ok":[{"$float":"-Infinity"},2]}`)
+}
+
+func main() {
+	for _, x := range []float64{math.NaN(), math.Inf(1), math.Inf(-1), 2.5} {
+		r, _, ok := faFast_t(x)
+		fmt.Println(math.IsNaN(r), r, ok)
+	}
+	r2, _, ok2 := faFast_u([]float64{math.NaN(), 1.5})
+	fmt.Println(math.IsInf(r2[0], -1), r2[1], ok2)
+	for _, s := range seen {
+		fmt.Fprintln(os.Stderr, "WIRE "+s)
+	}
+}
+"#;
+        fs::write(dir.join("go.mod"), "module t\n\ngo 1.22\n").unwrap();
+        fs::write(dir.join("bridge_t.go"), fill("t", "x float64", "x", "float64")).unwrap();
+        fs::write(dir.join("bridge_u.go"), fill("u", "xs []float64", "xs", "[]float64")).unwrap();
+        fs::write(dir.join("main.go"), main).unwrap();
+        let run = Command::new("go").args(["run", "."]).current_dir(&dir).env("CGO_ENABLED", "0").output().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
+        assert_eq!(
+            String::from_utf8_lossy(&run.stdout),
+            "true NaN true\nfalse +Inf true\nfalse -Inf true\nfalse 4.5 true\ntrue 2 true\n"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&run.stderr),
+            "WIRE [{\"$float\":\"NaN\"}]\nWIRE [{\"$float\":\"Infinity\"}]\nWIRE [{\"$float\":\"-Infinity\"}]\nWIRE [2.5]\nWIRE [[{\"$float\":\"NaN\"},1.5]]\n"
+        );
+    }
 
     #[test]
     fn the_bridge_returns_the_ports_error() {
@@ -665,6 +743,47 @@ func main() {
         assert!(lines.contains(r#"{"args":["x"],"raises":"strconv.Atoi: parsing \"x\": invalid syntax"}"#), "{lines}");
         assert!(
             lines.contains(r#""raises":"strconv.Atoi: parsing \"\": invalid syntax","derived":"edge"}"#),
+            "{lines}"
+        );
+        assert_eq!(after, lib);
+    }
+
+    #[test]
+    fn nan_and_infinity_are_recorded_tagged() {
+        if !Command::new("go").arg("version").output().is_ok_and(|o| o.status.success()) {
+            eprintln!("no go on PATH, skipping");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("fa-go-rec-floats-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("go.mod"), "module demo\n\ngo 1.22\n").unwrap();
+        let lib = "package main\n\nfunc lim(x float64) float64 {\n\treturn -x\n}\n";
+        let main = "package main\n\nimport (\n\t\"fmt\"\n\t\"math\"\n)\n\nfunc main() {\n\tfmt.Println(lim(math.NaN()) != lim(math.NaN()), lim(math.Inf(1)), lim(3))\n}\n";
+        fs::write(dir.join("lib.go"), lib).unwrap();
+        fs::write(dir.join("main.go"), main).unwrap();
+        let ctx = Ctx::open(&dir).unwrap();
+        let f = describe(&ctx, "go").unwrap().into_iter().find(|f| f.name == "lim").unwrap();
+        assert!(f.blockers.is_empty(), "{:?}", f.blockers);
+        let hs = Hotspot {
+            id: "main.lim".into(),
+            file: "lib.go".into(),
+            line: f.line,
+            name: "lim".into(),
+            qualname: "lim".into(),
+            params: f.params.clone(),
+            returns: f.returns.clone(),
+            ..Hotspot::default()
+        };
+        let out = dir.join("rec.jsonl");
+        let rec = record(&ctx, "go", &["run".into(), ".".into()], &hs, &out, 50).unwrap();
+        let lines = fs::read_to_string(&out).unwrap_or_default();
+        let after = fs::read_to_string(dir.join("lib.go")).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!((rec.calls, rec.kept, rec.skipped), (4, 4, 0), "{:?}", rec.unsupported);
+        assert!(lines.contains(r#"{"args":[{"$float":"NaN"}],"result":{"$float":"NaN"}}"#), "{lines}");
+        assert!(lines.contains(r#"{"args":[{"$float":"Infinity"}],"result":{"$float":"-Infinity"}}"#), "{lines}");
+        assert!(
+            lines.contains(r#"{"args":[{"$float":"-Infinity"}],"result":{"$float":"Infinity"},"derived":"edge"}"#),
             "{lines}"
         );
         assert_eq!(after, lib);
