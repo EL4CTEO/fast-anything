@@ -1,7 +1,7 @@
 //! fast-anything doctor: is everything a port needs installed?
 
 use crate::ui::{self, bold, dim, green, red, yellow};
-use anyhow::{Result, ensure};
+use anyhow::{Result, bail, ensure};
 use std::process::Command;
 
 fn version(program: &str, args: &[&str]) -> Option<String> {
@@ -53,14 +53,43 @@ fn problem(name: &str, found: &str) -> Option<String> {
     None
 }
 
-struct Check {
-    name: &'static str,
-    found: Option<String>,
-    need: &'static str,
-    hint: &'static str,
+pub struct Check {
+    pub name: &'static str,
+    pub found: Option<String>,
+    pub need: &'static str,
+    pub hint: &'static str,
 }
 
-pub fn run() -> Result<()> {
+fn is_usable(c: &Check) -> bool {
+    c.found.as_deref().is_some_and(|v| problem(c.name, v).is_none())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoctorOutcome {
+    ScanAndPortReady,
+    ScanReadyOnly,
+}
+
+pub fn evaluate_readiness(checks: &[Check], require_port: bool) -> Result<DoctorOutcome> {
+    let has_scan_runtime = checks
+        .iter()
+        .filter(|c| c.name != "cargo" && c.name != "claude" && c.name != "codex")
+        .any(is_usable);
+    ensure!(
+        has_scan_runtime,
+        "install Python, Node.js (or Bun, Deno), Ruby, Java, Go, PHP, .NET, R or a C compiler"
+    );
+    let cargo_usable = checks.iter().find(|c| c.name == "cargo").is_some_and(is_usable);
+    if cargo_usable {
+        Ok(DoctorOutcome::ScanAndPortReady)
+    } else if require_port {
+        bail!("Rust 1.85 or newer is needed to port, verify and enable");
+    } else {
+        Ok(DoctorOutcome::ScanReadyOnly)
+    }
+}
+
+pub fn run(require_port: bool) -> Result<()> {
     let python = version("python", &["--version"]).or_else(|| version("python3", &["--version"]));
     let checks = [
         Check {
@@ -145,13 +174,18 @@ pub fn run() -> Result<()> {
             hint: "npm i -g @openai/codex",
         },
     ];
-    let usable = |c: &Check| c.found.as_deref().is_some_and(|v| problem(c.name, v).is_none());
     for c in &checks {
         match &c.found {
             Some(v) => match problem(c.name, v) {
                 None => ui::line(format!("  {} {:<8} {}", green("✓"), bold(c.name), dim(v))),
+                Some(why) if c.name == "cargo" && !require_port => {
+                    ui::line(format!("  {} {:<8} {} {}", yellow("!"), bold(c.name), dim(v), why))
+                }
                 Some(why) => ui::line(format!("  {} {:<8} {} {}", red("✗"), bold(c.name), dim(v), why)),
             },
+            None if c.name == "cargo" && !require_port => {
+                ui::line(format!("  {} {:<8} missing, {}: {}", yellow("!"), bold(c.name), c.need, c.hint))
+            }
             None if c.name == "cargo" => {
                 ui::line(format!("  {} {:<8} missing, {}: {}", red("✗"), bold(c.name), c.need, c.hint))
             }
@@ -163,13 +197,16 @@ pub fn run() -> Result<()> {
             )),
         }
     }
-    ensure!(
-        checks[1..12].iter().any(usable),
-        "install Python, Node.js (or Bun, Deno), Ruby, Java, Go, PHP, .NET, R or a C compiler"
-    );
-    ui::ok("ready to scan");
-    ensure!(usable(&checks[0]), "Rust 1.85 or newer is needed to port, verify and enable");
-    ui::ok("ready to port");
+    match evaluate_readiness(&checks, require_port)? {
+        DoctorOutcome::ScanAndPortReady => {
+            ui::ok("ready to scan");
+            ui::ok("ready to port");
+        }
+        DoctorOutcome::ScanReadyOnly => {
+            ui::warn("Rust is optional for scanning; Rust 1.85+ is required to port, verify and enable");
+            ui::ok("ready to scan");
+        }
+    }
     Ok(())
 }
 
@@ -189,5 +226,77 @@ mod tests {
         assert_eq!(problem("node", "v22.0.0"), None);
         assert!(problem("python", "Python 3.9.18").is_some());
         assert_eq!(problem("clang", "Debian clang version 14.0.6"), None, "no minimum");
+    }
+
+    fn sample_check(name: &'static str, found: Option<&str>) -> Check {
+        Check {
+            name,
+            found: found.map(String::from),
+            need: "",
+            hint: "",
+        }
+    }
+
+    #[test]
+    fn scan_ready_when_cargo_missing_and_python_available() {
+        let checks = vec![
+            sample_check("cargo", None),
+            sample_check("python", Some("Python 3.11.0")),
+        ];
+        let outcome = evaluate_readiness(&checks, false).expect("normal doctor should succeed for scanning");
+        assert_eq!(outcome, DoctorOutcome::ScanReadyOnly);
+    }
+
+    #[test]
+    fn require_port_fails_when_cargo_missing() {
+        let checks = vec![
+            sample_check("cargo", None),
+            sample_check("python", Some("Python 3.11.0")),
+        ];
+        let err = evaluate_readiness(&checks, true).unwrap_err();
+        assert!(err.to_string().contains("Rust 1.85 or newer is needed"));
+    }
+
+    #[test]
+    fn fails_when_no_supported_scanning_runtime() {
+        let checks_with_cargo = vec![
+            sample_check("cargo", Some("cargo 1.88.0")),
+            sample_check("python", None),
+            sample_check("node", None),
+        ];
+        let err = evaluate_readiness(&checks_with_cargo, false).unwrap_err();
+        assert!(err.to_string().contains("install Python, Node.js"));
+
+        let checks_without_cargo = vec![
+            sample_check("cargo", None),
+            sample_check("python", None),
+        ];
+        assert!(evaluate_readiness(&checks_without_cargo, false).is_err());
+    }
+
+    #[test]
+    fn cargo_valid_succeeds_for_both_normal_and_require_port() {
+        let checks = vec![
+            sample_check("cargo", Some("cargo 1.88.0")),
+            sample_check("python", Some("Python 3.11.0")),
+        ];
+        let normal = evaluate_readiness(&checks, false).unwrap();
+        assert_eq!(normal, DoctorOutcome::ScanAndPortReady);
+
+        let required = evaluate_readiness(&checks, true).unwrap();
+        assert_eq!(required, DoctorOutcome::ScanAndPortReady);
+    }
+
+    #[test]
+    fn outdated_cargo_is_warning_normally_but_fails_require_port() {
+        let checks = vec![
+            sample_check("cargo", Some("cargo 1.80.0")),
+            sample_check("python", Some("Python 3.11.0")),
+        ];
+        let normal = evaluate_readiness(&checks, false).expect("outdated cargo should not block normal scan");
+        assert_eq!(normal, DoctorOutcome::ScanReadyOnly);
+
+        let err = evaluate_readiness(&checks, true).unwrap_err();
+        assert!(err.to_string().contains("Rust 1.85 or newer is needed"));
     }
 }

@@ -124,7 +124,11 @@ enum Cmd {
     /// Show the last scan and every port
     Status,
     /// Check that Rust, Python/Node and your agents are installed
-    Doctor,
+    Doctor {
+        /// Require Cargo/Rust to be installed and up to date
+        #[arg(long)]
+        require_port: bool,
+    },
     /// Run as an MCP server on stdio (for Claude Code, Codex, Cursor, ...)
     Mcp,
     /// Replays recorded calls against a C-bridge port (used by verify, in its own process)
@@ -221,7 +225,7 @@ fn run(cmd: Cmd, root: &Path) -> Result<()> {
             show::status(&state::Ctx::open(root)?);
             Ok(())
         }
-        Cmd::Doctor => doctor::run(),
+        Cmd::Doctor { require_port } => doctor::run(require_port),
         Cmd::Mcp | Cmd::Replay { .. } => unreachable!(),
     }
 }
@@ -257,5 +261,18 @@ mod tests {
             Cli::try_parse_from(["fast-anything", "verify"]).unwrap().cmd,
             Cmd::Verify { all: false, .. }
         ));
+    }
+
+    #[test]
+    fn doctor_parses() {
+        assert!(matches!(
+            Cli::try_parse_from(["fast-anything", "doctor"]).unwrap().cmd,
+            Cmd::Doctor { require_port: false }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["fast-anything", "doctor", "--require-port"]).unwrap().cmd,
+            Cmd::Doctor { require_port: true }
+        ));
+        assert!(Cli::try_parse_from(["fast-anything", "doctor", "--unknown"]).is_err());
     }
 }
