@@ -79,10 +79,10 @@ impl Hotspot {
 
     /// Why it isn't worth porting, if it isn't.
     pub fn why_not(&self) -> Option<String> {
-        if let Some(b) = self.blockers.first() {
-            Some(b.clone())
-        } else if let Some(by) = &self.covered_by {
+        if let Some(by) = &self.covered_by {
             Some(format!("ported inside {by}"))
+        } else if let Some(b) = self.blockers.first() {
+            Some(b.clone())
         } else if self.share < WORTH_IT {
             Some(format!(
                 "too small to matter ({:.1}% of the run, {:.0}% needed)",
@@ -224,10 +224,11 @@ pub fn rank(mut list: Vec<Hotspot>, wall: f64) -> Vec<Hotspot> {
         h.score = h.share * h.portability;
     }
     // Prefer the outermost portable function: one call into Rust instead of one per inner call.
+    // A helper blocked only by where it lives or its signature is also covered by its portable caller.
     let mut covers: Vec<Option<usize>> = (0..list.len())
         .map(|i| {
             let h = &list[i];
-            if !h.portable() {
+            if h.blockers.iter().any(|b| PASSED_ON.iter().any(|p| b.starts_with(p))) {
                 return None;
             }
             (0..list.len())
@@ -382,6 +383,9 @@ mod tests {
             10.0,
         );
         assert!(by_id(&ranked, "m.outer").worth_it());
+        let inner = by_id(&ranked, "m.inner");
+        assert_eq!(inner.covered_by.as_deref(), Some("m.outer"));
+        assert_eq!(inner.why_not().as_deref(), Some("ported inside m.outer"));
     }
 
     #[test]
@@ -567,6 +571,9 @@ mod tests {
                 10.0,
             );
             assert!(by_id(&ranked, "m.outer").portable(), "{blocker}");
+            let inner = by_id(&ranked, "m.inner");
+            assert_eq!(inner.covered_by.as_deref(), Some("m.outer"), "{blocker}");
+            assert_eq!(inner.why_not().as_deref(), Some("ported inside m.outer"), "{blocker}");
         }
     }
 
