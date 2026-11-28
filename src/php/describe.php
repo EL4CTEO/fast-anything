@@ -132,6 +132,8 @@ function describe_file(string $path): array {
                 $type .= text($t);
             }
             $type = trim($type);
+            // trailing comma, or whitespace-only between ( and ): no parameter
+            if ($var === null) { $cur = []; return; }
             if ($type !== '' && !in_array(strtolower($type), SCALARS, true)) $blockers[] = "takes a $type";
             $params[] = ['name' => $var, 'annotation' => $type === '' ? null : $type, 'default' => $default === null ? null : trim($default)];
             $cur = [];

@@ -133,11 +133,12 @@ fn hotspot(ctx: &Ctx, f: &Func, calls: u64, own: f64, cum: f64) -> Hotspot {
 }
 
 /// Insert text right after the { of each function (same line: no line numbers move).
-fn insert_at(text: &str, mut at: Vec<(usize, String)>) -> String {
+/// Offsets are byte indexes into the original file (PHP's tokenizer is byte-based).
+fn insert_at(text: &[u8], mut at: Vec<(usize, String)>) -> Vec<u8> {
     at.sort_by_key(|a| std::cmp::Reverse(a.0));
-    let mut out = text.to_string();
+    let mut out = text.to_vec();
     for (offset, piece) in at {
-        out.insert_str(offset, &piece);
+        out.splice(offset..offset, piece.into_bytes());
     }
     out
 }
@@ -202,8 +203,8 @@ pub fn profile(ctx: &Ctx, php: &str, args: &[String], duration: Option<f64>) -> 
     let _ = fs::remove_file(&out);
     let mut patches = Patches::new(ctx)?;
     for (path, at) in by_file {
-        let text = fs::read_to_string(path)?;
-        patches.write(path, &insert_at(&text, at))?;
+        let text = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        patches.write_bytes(path, &insert_at(&text, at))?;
     }
     let run = run_php_for(ctx, php, &prof, args, &[("FAST_ANYTHING_PROF_OUT", &out)], duration);
     patches.restore()?;
@@ -250,13 +251,13 @@ pub fn record(ctx: &Ctx, php: &str, args: &[String], hs: &Hotspot, out: &Path, l
         " if (!\\FastAnythingRec::$inside) return \\FastAnythingRec::record({}, func_get_args(), static fn(...$__faA) => {call}(...$__faA));",
         name_const(hs)
     );
-    let text = fs::read_to_string(&file)?;
+    let text = fs::read(&file).with_context(|| format!("reading {}", file.display()))?;
     let rec = ctx.fast.join("rec.php");
     fs::write(&rec, REC)?;
     let meta = out.with_extension("meta.json");
     let _ = fs::remove_file(&meta);
     let mut patches = Patches::new(ctx)?;
-    patches.write(&file, &insert_at(&text, vec![(f.body_offset, line)]))?;
+    patches.write_bytes(&file, &insert_at(&text, vec![(f.body_offset, line)]))?;
     let run = run_php(ctx, php, &rec, args, &[("FAST_ANYTHING_RECORD_OUT", out), ("FAST_ANYTHING_RECORD_META", &meta)]);
     patches.restore()?;
     let run = run?;
@@ -597,6 +598,66 @@ mod tests {
         assert_eq!(default_json("NULL").as_deref(), Some("null"));
         assert_eq!(default_json("array()").as_deref(), Some("[]"));
         assert_eq!(rust_type("?int").as_deref(), Some("Option<i64>"));
-        assert_eq!(insert_at("function f() {\n}", vec![(14, " X;".into())]), "function f() { X;\n}");
+        assert_eq!(insert_at(b"function f() {\n}", vec![(14, " X;".into())]), b"function f() { X;\n}");
+        // Latin-1 0xe9 is not UTF-8; insert still works at a byte offset
+        let latin1 = b"function f() {\n // caf\xe9\n}";
+        let patched = insert_at(latin1, vec![(14, " X;".into())]);
+        assert_eq!(&patched[..17], b"function f() { X;");
+        assert!(patched.contains(&0xe9), "{patched:?}");
+    }
+
+    #[test]
+    fn describes_trailing_comma_and_empty_params() {
+        if !Command::new("php").arg("-v").output().is_ok_and(|o| o.status.success()) {
+            eprintln!("no php on PATH, skipping");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("fa-php-params-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let app = "<?php\nfunction add(\n    int $a,\n    int $b,\n): int\n{\n    return $a + $b;\n}\nfinal class Greeter\n{\n    public function __construct(\n    ) {\n    }\n    public static function hi(string $n): string\n    {\n        return \"hi $n\";\n    }\n}\n$t = 0; for ($i = 0; $i < 1000; $i++) $t += add($i, 1);\necho Greeter::hi('x'), $t, \"\\n\";\n";
+        fs::write(dir.join("app.php"), app).unwrap();
+        let ctx = Ctx::open(&dir).unwrap();
+        let found = describe(&ctx, "php", &[dir.join("app.php")]).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        let add = found.iter().find(|f| f.name == "add").unwrap();
+        assert_eq!(add.params.len(), 2, "{:?}", add.params);
+        assert_eq!(add.params[0].name, "a");
+        assert_eq!(add.params[1].name, "b");
+        let ctor = found.iter().find(|f| f.name == "__construct").unwrap();
+        assert!(ctor.params.is_empty(), "{:?}", ctor.params);
+        let hi = found.iter().find(|f| f.name == "hi").unwrap();
+        assert_eq!(hi.params.len(), 1);
+        assert_eq!(hi.params[0].name, "n");
+    }
+
+    #[test]
+    fn profiles_latin1_source_comments() {
+        if !Command::new("php").arg("-v").output().is_ok_and(|o| o.status.success()) {
+            eprintln!("no php on PATH, skipping");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("fa-php-latin1-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("app.php"),
+            b"<?php\nrequire __DIR__.'/lib.php';\n$t = 0; for ($i = 0; $i < 100000; $i++) $t += twice($i);\necho $t, \"\\n\";\n",
+        )
+        .unwrap();
+        // Latin-1 0xe9 in a comment — PHP runs fine; scan must not abort
+        fs::write(
+            dir.join("lib.php"),
+            b"<?php\n// caf\xe9 (Latin-1 byte in a comment)\nfunction twice(int $x): int\n{\n    return $x * 2;\n}\n",
+        )
+        .unwrap();
+        let ctx = Ctx::open(&dir).unwrap();
+        let p = profile(&ctx, "php", &["app.php".into()], None);
+        let after_app = fs::read(dir.join("app.php")).unwrap();
+        let after_lib = fs::read(dir.join("lib.php")).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+        let p = p.expect("scan should tolerate Latin-1 comments");
+        assert!(p.functions.iter().any(|f| f.name == "twice" && f.ncalls == 100000), "{:?}", p.functions);
+        assert_eq!(after_lib.last(), Some(&b'\n'));
+        assert!(after_lib.contains(&0xe9), "Latin-1 byte restored");
+        assert!(after_app.starts_with(b"<?php"));
     }
 }
