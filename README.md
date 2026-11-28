@@ -77,6 +77,8 @@ Real runs on an i5-10500, Windows 11 (C and C++: a GitHub Actions Linux runner).
 | Java fuzzy dedupe | 3.50s | **1.18s, 3×** (11× on the function; the rest is JVM startup) |
 | C++ fuzzy dedupe | 3.02s | **1.09s, 2.7×** |
 
+> **Note on reproducing these numbers:** generated ports are multithreaded (they use `available_parallelism`), so whole-app speedups scale with the machine's thread count. The table above is from a 12-thread i5-10500. An independent reproduction of the Python fuzzy dedupe example on a 16-thread i7-11700 (Docker/Linux, Python 3.11, reference port) measured 5.23s → 16ms (337×, median of 5 rounds, A/A noise +2.0%), with all 33 replay cases matching the original.
+
 It ports the outermost loop it can, so the app crosses into Rust once instead of millions of times.
 
 ## Languages
