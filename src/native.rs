@@ -493,7 +493,7 @@ fn close(x: f64, y: f64, scale: f64) -> bool {
 /// sits in .fast/backup until then, so even a killed run is undone by the next one.
 pub struct Patches {
     dir: PathBuf,
-    files: Vec<(PathBuf, Option<String>)>,
+    files: Vec<(PathBuf, Option<Vec<u8>>)>,
 }
 
 impl Patches {
@@ -508,30 +508,35 @@ impl Patches {
         if self.files.iter().any(|(p, _)| p == path) {
             return Ok(());
         }
+        // bytes: source may not be UTF-8 (PHP Latin-1 comments, etc.)
         let original = if path.exists() {
-            Some(fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?)
+            Some(fs::read(path).with_context(|| format!("reading {}", path.display()))?)
         } else {
             None
         };
         let n = self.files.len();
         fs::write(self.dir.join(format!("{n}.path")), path.to_string_lossy().as_bytes())?;
-        if let Some(text) = &original {
-            fs::write(self.dir.join(format!("{n}.orig")), text)?;
+        if let Some(bytes) = &original {
+            fs::write(self.dir.join(format!("{n}.orig")), bytes)?;
         }
         self.files.push((path.to_path_buf(), original));
         Ok(())
     }
 
     pub fn write(&mut self, path: &Path, text: &str) -> Result<()> {
+        self.write_bytes(path, text.as_bytes())
+    }
+
+    pub fn write_bytes(&mut self, path: &Path, bytes: &[u8]) -> Result<()> {
         self.track(path)?;
-        fs::write(path, text).with_context(|| format!("writing {}", path.display()))
+        fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))
     }
 
     pub fn restore(&mut self) -> Result<()> {
         let mut first_err = None;
         for (path, original) in self.files.drain(..).rev() {
             let r = match original {
-                Some(text) => fs::write(&path, text),
+                Some(bytes) => fs::write(&path, bytes),
                 None => fs::remove_file(&path)
                     .or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) }),
             };
